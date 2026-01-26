@@ -1,6 +1,11 @@
 [
   {
     "kind": 9,
+    "label": "amo",
+    "preselect": true
+  },
+  {
+    "kind": 9,
     "label": "console",
     "preselect": true
   },

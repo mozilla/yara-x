@@ -1,0 +1,16 @@
+syntax = "proto2";
+
+import "yara.proto";
+
+package amo;
+
+option (yara.module_options) = {
+  name : "amo"
+  root_message: "amo.AMO"
+  rust_module: "amo"
+  cargo_feature: "amo-module"
+};
+
+message AMO {
+  // This module contains only exported functions, and doesn't return any data
+}

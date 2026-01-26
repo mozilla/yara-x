@@ -95,6 +95,25 @@
   {
     "additionalTextEdits": [
       {
+        "newText": "import \"amo\"\n",
+        "range": {
+          "end": {
+            "character": 0,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        }
+      }
+    ],
+    "kind": 9,
+    "label": "amo"
+  },
+  {
+    "additionalTextEdits": [
+      {
         "newText": "import \"console\"\n",
         "range": {
           "end": {

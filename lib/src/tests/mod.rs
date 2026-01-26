@@ -95,6 +95,9 @@ macro_rules! test_rule {
 }
 
 macro_rules! rule_true {
+    ($rule:expr,  $data:expr, $metadata:expr) => {{
+        test_rule!($rule, $data, $metadata, true);
+    }};
     ($rule:expr,  $data:expr) => {{
         test_rule!($rule, $data, true);
     }};
@@ -104,6 +107,9 @@ macro_rules! rule_true {
 }
 
 macro_rules! rule_false {
+    ($rule:expr,  $data:expr, $metadata:expr) => {{
+        test_rule!($rule, $data, $metadata, false);
+    }};
     ($rule:expr,  $data:expr) => {{
         test_rule!($rule, $data, false);
     }};

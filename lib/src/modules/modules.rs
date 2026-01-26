@@ -1,4 +1,6 @@
 // File generated automatically by build.rs. Do not edit.
+#[cfg(feature = "amo-module")]
+mod amo;
 #[cfg(feature = "console-module")]
 mod console;
 #[cfg(feature = "crx-module")]

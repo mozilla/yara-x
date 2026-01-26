@@ -1,5 +1,6 @@
 // @generated
 
+pub mod amo;
 pub mod analysis;
 pub mod console;
 pub mod crx;

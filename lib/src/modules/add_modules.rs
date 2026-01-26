@@ -1,5 +1,7 @@
 // File generated automatically by build.rs. Do not edit.
 {
+#[cfg(feature = "amo-module")]
+add_module!(modules, "amo", amo, "amo.AMO", Some("amo"), Some(amo::__main__ as MainFn));
 #[cfg(feature = "console-module")]
 add_module!(modules, "console", console, "console.Console", Some("console"), Some(console::__main__ as MainFn));
 #[cfg(feature = "crx-module")]
