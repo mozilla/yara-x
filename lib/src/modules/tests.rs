@@ -177,6 +177,9 @@ fn test_modules() {
 fn test_module_names() {
     let mut names = module_names();
 
+    #[cfg(feature = "amo-module")]
+    assert_eq!(names.next(), Some("amo"));
+
     #[cfg(feature = "console-module")]
     assert_eq!(names.next(), Some("console"));
 

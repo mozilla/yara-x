@@ -224,8 +224,12 @@ vt-module = [
     "dep:psl",
 ]
 
+# AMO module
+amo-module = ["dep:serde_json_path"]
+
 # Enables all the default modules.
 default-modules = [
+    "amo-module",
     "console-module",
     "crx-module",
     "cuckoo-module",
@@ -301,6 +305,7 @@ rsa = { workspace = true, optional = true }
 smallvec = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
+serde_json_path = { workspace = true, optional = true }
 strum_macros = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, optional = true }

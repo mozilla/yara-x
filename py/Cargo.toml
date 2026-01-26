@@ -16,6 +16,7 @@ doc = false
 crate-type = ["cdylib"]
 
 [features]
+amo-module = ["yara-x/amo-module"]
 console-module = ["yara-x/console-module"]
 crx-module = ["yara-x/crx-module"]
 cuckoo-module = ["yara-x/cuckoo-module"]
@@ -36,6 +37,7 @@ test_proto3-module = ["yara-x/test_proto3-module"]
 
 # YARA-X modules that are enabled by default.
 default = [
+    "amo-module",
     "console-module",
     "crx-module",
     "cuckoo-module",
