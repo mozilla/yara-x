@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - amo
+
+jobs:
+  test:
+    env:
+      CARGO_TERM_COLOR: always
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source $HOME/.cargo/env
+          rustup toolchain install
+          rustup component add clippy
+          rustup component add rustfmt
+      - run: cargo test
+      - run: cargo doc --no-deps
+      - run: cargo clippy --tests --no-deps -- --deny clippy::all
+      - run: cargo fmt --all --check
