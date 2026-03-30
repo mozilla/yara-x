@@ -1,0 +1,112 @@
+name: Sync git repo with upstream
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'  # Every Monday at 08:00 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    name: Sync from upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: amo
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/VirusTotal/yara-x.git
+          git fetch upstream
+
+      - name: Check for new changes
+        id: check
+        run: |
+          NEW_COMMITS=$(git log HEAD..upstream/main --oneline --no-decorate)
+          if [ -z "$NEW_COMMITS" ]; then
+            echo "No new upstream commits, skipping."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            SHORT_SHA=$(git rev-parse --short upstream/main)
+            echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+            COMMIT_LOG=$(echo "$NEW_COMMITS" | head -30)
+            {
+              echo "commit_log<<EOF"
+              echo "$COMMIT_LOG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create sync branch
+        if: steps.check.outputs.has_changes == 'true'
+        id: branch
+        env:
+          STEPS_CHECK_OUTPUTS_SHORT_SHA: ${{ steps.check.outputs.short_sha }}
+        run: |
+          BRANCH="sync/upstream-${STEPS_CHECK_OUTPUTS_SHORT_SHA}"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH"
+
+      - name: Merge changes from upstream and push sync branch
+        if: steps.check.outputs.has_changes == 'true'
+        id: merge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEPS_BRANCH_OUTPUTS_NAME: ${{ steps.branch.outputs.name }}
+        run: |
+          git merge upstream/main --no-edit
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin "${STEPS_BRANCH_OUTPUTS_NAME}" --force
+          git remote rm upstream
+
+      - name: Create issue on merge failure
+        if: failure() && steps.merge.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHORT_SHA: ${{ steps.check.outputs.short_sha }}
+        run: |
+          gh issue create \
+            --title "Upstream sync failed: merge conflict ($SHORT_SHA)" \
+            --body "The [Sync Upstream](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow failed to merge upstream changes into the \`amo\` branch due to a conflict.
+
+          **Upstream commit:** \`$SHORT_SHA\`
+
+          Please resolve the conflict manually by merging \`upstream/main\` into the \`sync/upstream-$SHORT_SHA\` branch." \
+
+      - name: Create pull request
+        if: steps.check.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEPS_BRANCH_OUTPUTS_NAME: ${{ steps.branch.outputs.name }}
+          STEPS_CHECK_OUTPUTS_SHORT_SHA: ${{ steps.check.outputs.short_sha }}
+          STEPS_CHECK_OUTPUTS_COMMIT_LOG: ${{ steps.check.outputs.commit_log }}
+        run: |
+          gh pr create \
+            --base amo \
+            --head "${STEPS_BRANCH_OUTPUTS_NAME}" \
+            --title "chore: sync upstream changes (${STEPS_CHECK_OUTPUTS_SHORT_SHA})" \
+            --body "This PR brings in the latest changes from [VirusTotal/yara-x](https://github.com/VirusTotal/yara-x).
+
+          ### Commits included
+          \`\`\`
+          ${STEPS_CHECK_OUTPUTS_COMMIT_LOG}
+          \`\`\`
+
+          > Generated automatically by the [Sync Upstream](${{ github.server_url }}/${{ github.repository }}/actions/workflows/sync_upstream.yaml) workflow." \
+          || echo "PR already exists for this branch, skipping."
