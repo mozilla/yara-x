@@ -2,7 +2,7 @@ name: Sync git repo with upstream
 
 on:
   schedule:
-    - cron: '0 8 * * 1'  # Every Monday at 08:00 UTC
+    - cron: '0 8 * * 1-5'  # Every working day (Mon-Fri) at 08:00 UTC
   workflow_dispatch:
 
 permissions: {}
