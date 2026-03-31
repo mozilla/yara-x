@@ -6,6 +6,8 @@ on:
     branches:
       - amo
 
+permissions: {}
+
 jobs:
   test:
     env:
