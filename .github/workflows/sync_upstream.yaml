@@ -100,6 +100,7 @@ jobs:
           gh pr create \
             --base amo \
             --head "${STEPS_BRANCH_OUTPUTS_NAME}" \
+            --draft \
             --title "chore: sync upstream changes (${STEPS_CHECK_OUTPUTS_SHORT_SHA})" \
             --body "This PR brings in the latest changes from [VirusTotal/yara-x](https://github.com/VirusTotal/yara-x).
 
