@@ -10,9 +10,8 @@ keywords = ["pattern-matching", "cybersecurity", "forensics", "malware", "yara"]
 
 # When updating rust-version also update MSRV in:
 #   .github/workflows/tests.yaml
-#   .github/workflows/code_health.yaml
 #
-rust-version = "1.89.0"
+rust-version = "1.91.0"
 
 [workspace]
 members = [
@@ -108,7 +107,7 @@ walrus = "0.26.1"
 wasm-bindgen = "0.2.117"
 wasm-bindgen-test = "0.3.67"
 wasm-opt = "0.116.1"
-wasmtime = { version = "40.0.4", default-features = false }
+wasmtime = { version = "43.0.1", default-features = false }
 x509-parser = "0.18.0"
 yansi = "1.0.1"
 yara-x = { path = "lib", version = "1.15.0" }

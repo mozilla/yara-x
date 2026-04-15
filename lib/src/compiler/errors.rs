@@ -652,7 +652,7 @@ pub struct InvalidModifier {
 #[associated_enum(CompileError)]
 #[error(code = "E034", title = "potentially slow loop")]
 #[label(
-"this range can be very large",
+    "this range can be very large",
     loc
 )]
 pub struct PotentiallySlowLoop {
