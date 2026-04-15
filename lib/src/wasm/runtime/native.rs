@@ -3,8 +3,9 @@
 //! This adapter exists only to normalize a couple of APIs so the rest of the
 //! crate can talk to native and custom runtimes through the same interface.
 
-use anyhow::Result;
-
+use crate::errors::SerializationError;
+use anyhow::anyhow;
+use std::mem::transmute;
 /// Wasmtime types re-exported by the native runtime.
 pub(crate) use wasmtime::{
     AsContext, AsContextMut, Caller, Config, Engine, Extern, FuncType, Global,
@@ -15,8 +16,14 @@ pub(crate) use wasmtime::{
 /// Thin wrapper around [`wasmtime::Linker`] with a backend-neutral API.
 pub(crate) struct Linker<T>(wasmtime::Linker<T>);
 
-type Trampoline<T> =
-    dyn Fn(Caller<'_, T>, &mut [ValRaw]) -> Result<()> + Send + Sync + 'static;
+pub(crate) type Trampoline<T> = Box<
+    dyn Fn(Caller<'_, T>, &mut [ValRaw]) -> TrampolineResult
+        + Send
+        + Sync
+        + 'static,
+>;
+
+pub(crate) type TrampolineResult = wasmtime::Result<()>;
 
 impl<T: 'static> Linker<T> {
     /// Creates a new linker.
@@ -35,11 +42,21 @@ impl<T: 'static> Linker<T> {
         name: &str,
         ty: FuncType,
         sync_flags: u32,
-        trampoline: Box<Trampoline<T>>,
-    ) -> Result<()> {
+        trampoline: Trampoline<T>,
+    ) -> TrampolineResult {
         let _ = sync_flags;
         unsafe {
-            self.0.func_new_unchecked(module, name, ty, trampoline).map(|_| ())
+            self.0
+                .func_new_unchecked(module, name, ty, move |caller, args| {
+                    trampoline(
+                        caller,
+                        transmute::<
+                            &mut [std::mem::MaybeUninit<ValRaw>],
+                            &mut [ValRaw],
+                        >(args),
+                    )
+                })
+                .map(|_| ())
         }
     }
 
@@ -50,7 +67,7 @@ impl<T: 'static> Linker<T> {
         module: &str,
         name: &str,
         item: impl Into<Extern>,
-    ) -> Result<&mut Self> {
+    ) -> wasmtime::Result<&mut Self> {
         self.0.define(store, module, name, item)?;
         Ok(self)
     }
@@ -60,7 +77,9 @@ impl<T: 'static> Linker<T> {
         &self,
         store: impl AsContextMut<Data = T>,
         module: &Module,
-    ) -> Result<Instance> {
-        self.0.instantiate(store, module)
+    ) -> Result<Instance, SerializationError> {
+        self.0
+            .instantiate(store, module)
+            .map_err(|e| SerializationError::InvalidWASM(anyhow!(e)))
     }
 }
