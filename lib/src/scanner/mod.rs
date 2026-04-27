@@ -16,6 +16,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use bitvec::prelude::*;
+#[cfg(unix)]
+use memmap2::Advice;
 use memmap2::{Mmap, MmapOptions};
 use protobuf::{CodedInputStream, MessageDyn};
 use thiserror::Error;
@@ -477,6 +479,10 @@ impl<'r> Scanner<'r> {
                     ScanError::MapError { path: path.to_path_buf(), err }
                 })
             }?;
+            #[cfg(unix)]
+            mapped_file.advise(Advice::Sequential).map_err(|err| {
+                ScanError::MapError { path: path.to_path_buf(), err }
+            })?;
             ScannedData::Mmap(mapped_file)
         } else {
             buffered_file = Vec::with_capacity(size as usize);
