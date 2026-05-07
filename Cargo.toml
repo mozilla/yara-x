@@ -1,5 +1,5 @@
 [workspace.package]
-version = "1.15.0"
+version = "1.16.0"
 authors = ["Victor M. Alvarez <vmalvarez@virustotal.com>"]
 edition = "2024"
 homepage = "https://virustotal.github.io/yara-x"
@@ -32,7 +32,7 @@ resolver = "3"
 
 
 [workspace.dependencies]
-aho-corasick = "1.1.4"
+daachorse = "3.0.0"
 annotate-snippets = "0.12.15"
 anyhow = "1.0.102"
 hex = "0.4.3"
@@ -66,7 +66,6 @@ inventory = "0.3.24"
 ipnet = "2.12.0"
 itertools = "0.14.0"
 js-sys = "0.3.94"
-linkme = "0.3.35"
 log = "0.4.29"
 magic = "0.16.7"
 md2 = "0.10.2"
@@ -107,16 +106,16 @@ walrus = "0.26.1"
 wasm-bindgen = "0.2.117"
 wasm-bindgen-test = "0.3.67"
 wasm-opt = "0.116.1"
-wasmtime = { version = "43.0.1", default-features = false }
+wasmtime = { version = "43.0.2", default-features = false }
 x509-parser = "0.18.0"
 yansi = "1.0.1"
-yara-x = { path = "lib", version = "1.15.0" }
-yara-x-fmt = { path = "fmt", version = "1.15.0" }
-yara-x-macros = { path = "macros", version = "1.15.0" }
-yara-x-parser = { path = "parser", version = "1.15.0" }
-yara-x-proto = { path = "proto", version = "1.15.0"}
-yara-x-proto-yaml = { path = "proto-yaml", version = "1.15.0" }
-yara-x-proto-json = { path = "proto-json", version = "1.15.0" }
+yara-x = { path = "lib", version = "1.16.0" }
+yara-x-fmt = { path = "fmt", version = "1.16.0" }
+yara-x-macros = { path = "macros", version = "1.16.0" }
+yara-x-parser = { path = "parser", version = "1.16.0" }
+yara-x-proto = { path = "proto", version = "1.16.0"}
+yara-x-proto-yaml = { path = "proto-yaml", version = "1.16.0" }
+yara-x-proto-json = { path = "proto-json", version = "1.16.0" }
 zip = { version = "8.2.0", default-features = false }
 simd-adler32 = "0.3.8"
 simd_cesu8 = "1.1.1"
