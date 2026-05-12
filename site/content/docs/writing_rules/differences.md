@@ -204,8 +204,8 @@ valid
 only within the `with` statement. For example:
 
 ```
-with 
-    a = 1 + 1, 
+with
+    a = 1 + 1,
     b = 2 : (
         a == b
   )
@@ -265,7 +265,7 @@ instance, the following is valid:
 
 ```
 global global global rule duplicated_global  {
-   ... 
+   ...
 }
 ```
 
