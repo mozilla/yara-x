@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use nom::bytes::complete::take;
@@ -14,77 +15,72 @@ use crate::modules::utils::leb128::uleb128;
 type Error<'a> = nom::error::Error<&'a [u8]>;
 
 #[derive(Default)]
-pub struct Dex {
+pub struct Dex<'a> {
     // DEX header information
     header: DexHeader,
 
     // List with all found strings
-    strings: Vec<Rc<String>>,
+    strings: Vec<Cow<'a, str>>,
 
     // List with all found types
-    types: Vec<Rc<String>>,
+    types: Vec<Cow<'a, str>>,
 
     // List with all found prototypes
-    protos: Vec<Rc<ProtoItem>>,
+    protos: Vec<Rc<ProtoItem<'a>>>,
 
     // List with all found fields
-    fields: Vec<FieldItem>,
+    fields: Vec<FieldItem<'a>>,
 
     // List with all found methods
-    methods: Vec<MethodItem>,
+    methods: Vec<MethodItem<'a>>,
 
     // List with all found classes
-    class_defs: Vec<ClassItem>,
+    class_defs: Vec<ClassItem<'a>>,
 
     // Map information
     map_list: Option<MapList>,
 }
 
-impl Dex {
-    // the type of endianness used in the file
+impl<'a> Dex<'a> {
     const ENDIAN_CONSTANT: u32 = 0x12345678;
     const REVERSE_ENDIAN_CONSTANT: u32 = 0x78563412;
-
-    // lack of information
+    const DEX_HEADER_SIZE: u32 = 0x70;
     const NO_INDEX: u32 = 0xffffffff;
 
-    pub fn parse<'a>(data: &'a [u8]) -> Result<Self, Err<Error<'a>>> {
+    const MAX_STRINGS: usize = 1_000_000;
+    const MAX_TYPES: usize = 1_000_000;
+    const MAX_PROTOS: usize = 1_000_000;
+    const MAX_CLASSES: usize = 1_000_000;
+    const MAX_METHODS: usize = 1_000_000;
+    const MAX_FIELDS: usize = 1_000_000;
+
+    pub fn parse(data: &'a [u8]) -> Result<Self, Err<Error<'a>>> {
         // Extract dex header with information about data location
-        let (strings_offset, header) = Self::parse_dex_header(data)?;
+        let (_, header) = Self::parse_dex_header(data)?;
 
         // Extract defined strings
-        let (types_offset, strings) =
-            Self::parse_strings(strings_offset, data, &header)?;
+        let strings = Self::parse_strings(data, &header);
 
         // Extract defined types
-        let (proto_offset, types) =
-            Self::parse_types(types_offset, &header, &strings)?;
+        let types = Self::parse_types(data, &header, &strings);
 
-        // Exctract defined prototypes
-        let (field_offset, proto_ids) = Self::parse_proto_ids(
-            proto_offset,
+        // Extract defined prototypes
+        let protos = Self::parse_protos(data, &header, &strings, &types);
+
+        // Extract defined fields
+        let fields = Self::parse_fields(data, &header, &strings, &types);
+
+        // Extract defined methods
+        let methods = Self::parse_methods(
             data,
             &header,
             &strings,
             &types,
-        )?;
-
-        // Extract defined fields
-        let (method_offset, fields) =
-            Self::parse_fields(field_offset, &header, &strings, &types)?;
-
-        // Extract defined methods
-        let (class_offset, methods) = Self::parse_methods(
-            method_offset,
-            &header,
-            &strings,
-            &types,
-            &proto_ids,
-        )?;
+            &protos,
+        );
 
         // Extract defined classes
-        let (_, class_defs) =
-            Self::parse_class_defs(class_offset, &header, &strings, &types)?;
+        let class_defs = Self::parse_class_defs(data, &header, &strings, &types);
 
         // Extract map information
         let map_list = Self::parse_map_items(data, &header);
@@ -93,7 +89,7 @@ impl Dex {
             header,
             strings,
             types,
-            protos: proto_ids,
+            protos,
             fields,
             methods,
             class_defs,
@@ -201,49 +197,62 @@ impl Dex {
     /// A HashMap is needed to quickly access an item by its index.
     ///
     /// See: https://source.android.com/docs/core/runtime/dex-format#string-item
-    fn parse_strings<'a>(
-        remainder: &'a [u8],
+    fn parse_strings(
         data: &'a [u8],
         header: &DexHeader,
-    ) -> IResult<&'a [u8], Vec<Rc<String>>> {
+    ) -> Vec<Cow<'a, str>> {
         // DEX file doesn't contain strings.
         // It's a strange case, but it needs to be checked.
         if header.string_ids_off == 0 {
-            return Ok((remainder, Vec::new()));
+            return Vec::new();
         }
 
-        let mut it = iterator(remainder, le_u32);
+        let table_slice = match data.get(header.string_ids_off as usize..) {
+            Some(slice) => slice,
+            None => return Vec::new(),
+        };
+
+        let mut it = iterator(table_slice, le_u32::<&[u8], Error>);
 
         let string_offsets = it
             .by_ref()
+            .take(Self::MAX_STRINGS)
             .take(header.string_ids_size as usize)
             .filter_map(|offset| Self::parse_string_from_offset(data, offset))
-            .map(Rc::new)
             .collect();
 
-        let (rem, _) = it.finish()?;
+        let _ = it.finish();
 
-        Ok((rem, string_offsets))
+        string_offsets
     }
 
     /// Parses string by index in the string_ids_off table
     ///
     /// idx - is an index in the string_ids_off table
     /// strings_ids_off[idx] -> string_data_item
+    ///
+    /// Strings larger than 64KB will be considered invalid and the result will
+    /// be None.
     fn parse_string_from_offset(
-        data: &[u8],
+        data: &'a [u8],
         string_data_offset: u32,
-    ) -> Option<String> {
-        data.get(string_data_offset as usize..).and_then(|data| {
-            let (data, utf16_size) = uleb128(data).ok()?;
-            let (_, bytes) =
-                take::<usize, &[u8], Error>(utf16_size as usize)(data).ok()?;
+    ) -> Option<Cow<'a, str>> {
+        if string_data_offset < Self::DEX_HEADER_SIZE {
+            return None;
+        }
 
-            // Decode MUTF-8 string and save it
-            match simd_cesu8::mutf8::decode(bytes) {
-                Ok(v) => Some(v.to_string()),
-                Err(_) => None,
+        data.get(string_data_offset as usize..).and_then(|slice| {
+            let (slice, utf16_size) = uleb128(slice).ok()?;
+
+            if utf16_size > 65536 || (utf16_size as usize) > data.len() {
+                return None;
             }
+
+            let (_, bytes) =
+                take::<usize, &[u8], Error>(utf16_size as usize)(slice).ok()?;
+
+            // Decode MUTF-8 string and return Cow<'a, str>
+            simd_cesu8::mutf8::decode(bytes).ok()
         })
     }
 
@@ -253,58 +262,70 @@ impl Dex {
     /// `type_item = string_item[type_ids_off[idx]]`
     ///
     /// See: https://source.android.com/docs/core/runtime/dex-format#type-id-item
-    fn parse_types<'a>(
-        remainder: &'a [u8],
+    fn parse_types(
+        data: &'a [u8],
         header: &DexHeader,
-        string_items: &[Rc<String>],
-    ) -> IResult<&'a [u8], Vec<Rc<String>>> {
+        string_items: &[Cow<'a, str>],
+    ) -> Vec<Cow<'a, str>> {
         // DEX file doesn't contain types.
         // It's a strange case, but it needs to be checked.
         if header.type_ids_off == 0 {
-            return Ok((remainder, Vec::new()));
+            return Vec::new();
         }
 
-        let mut it = iterator(remainder, le_u32);
+        let table_slice = match data.get(header.type_ids_off as usize..) {
+            Some(slice) => slice,
+            None => return Vec::new(),
+        };
+
+        let mut it = iterator(table_slice, le_u32::<&[u8], Error>);
 
         let type_indexes = it
             .by_ref()
+            .take(Self::MAX_TYPES)
             .take(header.type_ids_size as usize)
             .filter_map(|idx| string_items.get(idx as usize).cloned())
             .collect();
 
-        let (rem, _) = it.finish()?;
+        let _ = it.finish();
 
-        Ok((rem, type_indexes))
+        type_indexes
     }
 
     /// Collects a list of prototypes in a hashmap from proto_ids_off list.
     ///
     /// See: https://source.android.com/docs/core/runtime/dex-format#proto-id-item
     /// See: https://source.android.com/docs/core/runtime/dex-format#type-list
-    fn parse_proto_ids<'a>(
-        remainder: &'a [u8],
+    fn parse_protos(
         data: &'a [u8],
         header: &DexHeader,
-        string_items: &[Rc<String>],
-        type_items: &[Rc<String>],
-    ) -> IResult<&'a [u8], Vec<Rc<ProtoItem>>> {
+        string_items: &[Cow<'a, str>],
+        type_items: &[Cow<'a, str>],
+    ) -> Vec<Rc<ProtoItem<'a>>> {
         // DEX file doesn't contain prototypes.
         // It's a strange case, but it needs to be checked.
         if header.proto_ids_off == 0 {
-            return Ok((remainder, Vec::new()));
+            return Vec::new();
         }
 
-        let mut it = iterator(remainder, (le_u32, le_u32, le_u32));
+        let table_slice = match data.get(header.proto_ids_off as usize..) {
+            Some(slice) => slice,
+            None => return Vec::new(),
+        };
+
+        let mut it = iterator(table_slice, (le_u32::<&[u8], Error>, le_u32, le_u32));
 
         let proto_entries = it
             .by_ref()
+            .take(Self::MAX_PROTOS)
             .take(header.proto_ids_size as usize)
             .filter_map(|(shorty_idx, return_type_idx, parameters_off)| {
                 let shorty = string_items.get(shorty_idx as usize)?.clone();
                 let return_type =
                     type_items.get(return_type_idx as usize)?.clone();
 
-                // According to the documentation, if parameters_off is 0, then the type has 0 parameters.
+                // According to the documentation, if parameters_off is 0, then
+                // the type has 0 parameters.
                 let parameters = if parameters_off == 0 {
                     Vec::new()
                 } else {
@@ -321,24 +342,29 @@ impl Dex {
             })
             .collect();
 
-        let (rem, _) = it.finish()?;
+        let _ = it.finish();
 
-        Ok((rem, proto_entries))
+        proto_entries
     }
 
     /// Collects a type list to list of strings from given offset
     ///
     /// See: https://source.android.com/docs/core/runtime/dex-format#type-list
     fn parse_type_list(
-        data: &[u8],
-        type_items: &[Rc<String>],
+        data: &'a [u8],
+        type_items: &[Cow<'a, str>],
         offset: u32,
-    ) -> Option<Vec<Rc<String>>> {
+    ) -> Option<Vec<Cow<'a, str>>> {
         let remainder = data.get(offset as usize..)?;
+        let (remainder, size) = le_u32::<&[u8], Error>(remainder).ok()?;
 
-        let (rem, size) = le_u32::<&[u8], Error>(remainder).ok()?;
+        // The number of arguments can't be higher than 255 due to constraints
+        // in the Dalvik bytecode instruction set itself.
+        if size > 255 {
+            return None;
+        }
 
-        let mut it = iterator(rem, le_u32::<&[u8], Error>);
+        let mut it = iterator(remainder, le_u16::<&[u8], Error>);
         let items = it
             .by_ref()
             .take(size as usize)
@@ -353,22 +379,28 @@ impl Dex {
     /// Collects a list of fields in a hashmap from field_ids_off list.
     ///
     /// See: https://source.android.com/docs/core/runtime/dex-format#field-id-item
-    fn parse_fields<'a>(
-        remainder: &'a [u8],
+    fn parse_fields(
+        data: &'a [u8],
         header: &DexHeader,
-        string_items: &[Rc<String>],
-        type_items: &[Rc<String>],
-    ) -> IResult<&'a [u8], Vec<FieldItem>> {
+        string_items: &[Cow<'a, str>],
+        type_items: &[Cow<'a, str>],
+    ) -> Vec<FieldItem<'a>> {
         // DEX file doesn't contain fields.
         // It's a strange case, but it needs to be checked.
         if header.field_ids_off == 0 {
-            return Ok((remainder, Vec::new()));
+            return Vec::new();
         }
 
-        let mut it = iterator(remainder, (le_u16, le_u16, le_u32));
+        let table_slice = match data.get(header.field_ids_off as usize..) {
+            Some(slice) => slice,
+            None => return Vec::new(),
+        };
+
+        let mut it = iterator(table_slice, (le_u16::<&[u8], Error>, le_u16, le_u32));
 
         let field_entries = it
             .by_ref()
+            .take(Self::MAX_FIELDS)
             .take(header.field_ids_size as usize)
             .filter_map(|(class_idx, type_idx, name_idx)| {
                 let class = type_items.get(class_idx as usize)?.clone();
@@ -379,31 +411,37 @@ impl Dex {
             })
             .collect();
 
-        let (rem, _) = it.finish()?;
+        let _ = it.finish();
 
-        Ok((rem, field_entries))
+        field_entries
     }
 
     /// Collects a list of methods in a hashmap from method_ids_off list.
     ///
     /// See: https://source.android.com/docs/core/runtime/dex-format#method-id-item
-    fn parse_methods<'a>(
-        remainder: &'a [u8],
+    fn parse_methods(
+        data: &'a [u8],
         header: &DexHeader,
-        string_items: &[Rc<String>],
-        type_items: &[Rc<String>],
-        proto_items: &[Rc<ProtoItem>],
-    ) -> IResult<&'a [u8], Vec<MethodItem>> {
+        string_items: &[Cow<'a, str>],
+        type_items: &[Cow<'a, str>],
+        proto_items: &[Rc<ProtoItem<'a>>],
+    ) -> Vec<MethodItem<'a>> {
         // DEX file doesn't contain methods
         // It's a strange case, but it needs to be checked.
         if header.method_ids_off == 0 {
-            return Ok((remainder, Vec::new()));
+            return Vec::new();
         }
 
-        let mut it = iterator(remainder, (le_u16, le_u16, le_u32));
+        let table_slice = match data.get(header.method_ids_off as usize..) {
+            Some(slice) => slice,
+            None => return Vec::new(),
+        };
+
+        let mut it = iterator(table_slice, (le_u16::<&[u8], Error>, le_u16, le_u32));
 
         let method_entries = it
             .by_ref()
+            .take(Self::MAX_METHODS)
             .take(header.method_ids_size as usize)
             .filter_map(|(class_idx, proto_idx, name_idx)| {
                 let class = type_items.get(class_idx as usize)?.clone();
@@ -414,9 +452,9 @@ impl Dex {
             })
             .collect();
 
-        let (rem, _) = it.finish()?;
+        let _ = it.finish();
 
-        Ok((rem, method_entries))
+        method_entries
     }
 
     /// Collects a list of classes from class_defs_off list.
@@ -424,24 +462,40 @@ impl Dex {
     /// useful when writing YARA rules.
     ///
     /// See: https://source.android.com/docs/core/runtime/dex-format#class-def-item
-    fn parse_class_defs<'a>(
-        remainder: &'a [u8],
+    fn parse_class_defs(
+        data: &'a [u8],
         header: &DexHeader,
-        string_items: &[Rc<String>],
-        type_items: &[Rc<String>],
-    ) -> IResult<&'a [u8], Vec<ClassItem>> {
+        string_items: &[Cow<'a, str>],
+        type_items: &[Cow<'a, str>],
+    ) -> Vec<ClassItem<'a>> {
         // DEX file doesn't contain classess
         // It's a strange case, but it needs to be checked.
         if header.class_defs_off == 0 {
-            return Ok((remainder, Vec::new()));
+            return Vec::new();
         }
 
-        // (class_idx, access_flags, superclass_idx, _, source_file_idx)
-        let mut it =
-            iterator(remainder, (le_u32, le_u32, le_u32, le_u32, le_u32));
+        let table_slice = match data.get(header.class_defs_off as usize..) {
+            Some(slice) => slice,
+            None => return Vec::new(),
+        };
+
+        let mut it = iterator(
+            table_slice,
+            (
+                le_u32::<&[u8], Error>, // class_idx
+                le_u32,                 // access_flags
+                le_u32,                 // superclass_idx
+                le_u32,                 // interfaces_off
+                le_u32,                 // source_file_idx
+                le_u32,                 // annotations_off
+                le_u32,                 // class_data_off
+                le_u32,                 // static_values_off
+            ),
+        );
 
         let class_entries = it
             .by_ref()
+            .take(Self::MAX_CLASSES)
             .take(header.class_defs_size as usize)
             .filter_map(
                 |(
@@ -450,6 +504,9 @@ impl Dex {
                     superclass_idx,
                     _,
                     source_file_idx,
+                    _,
+                    _,
+                    _,
                 )| {
                     let class = type_items.get(class_idx as usize)?.clone();
                     let superclass = if superclass_idx != Self::NO_INDEX {
@@ -473,9 +530,9 @@ impl Dex {
             )
             .collect();
 
-        let (rem, _) = it.finish()?;
+        let _ = it.finish();
 
-        Ok((rem, class_entries))
+        class_entries
     }
 
     /// Collects information about maps from the DEX file
@@ -484,7 +541,6 @@ impl Dex {
     fn parse_map_items(data: &[u8], header: &DexHeader) -> Option<MapList> {
         data.get(header.map_off as usize..).and_then(|offset| {
             let (items_offset, size) = le_u32::<&[u8], Error>(offset).ok()?;
-
             let mut it = iterator(items_offset, Self::parse_map_item);
             let items = it.by_ref().take(size as usize).collect();
             let _ = it.finish();
@@ -584,33 +640,33 @@ struct DexHeader {
 }
 
 #[derive(Debug)]
-pub struct ProtoItem {
-    shorty: Rc<String>,
-    return_type: Rc<String>,
+pub struct ProtoItem<'a> {
+    shorty: Cow<'a, str>,
+    return_type: Cow<'a, str>,
     parameters_count: u32,
-    parameters: Vec<Rc<String>>,
+    parameters: Vec<Cow<'a, str>>,
 }
 
 #[derive(Debug)]
-pub struct FieldItem {
-    class: Rc<String>,
-    type_: Rc<String>,
-    name: Rc<String>,
+pub struct FieldItem<'a> {
+    class: Cow<'a, str>,
+    type_: Cow<'a, str>,
+    name: Cow<'a, str>,
 }
 
 #[derive(Debug)]
-pub struct MethodItem {
-    class: Rc<String>,
-    proto: Rc<ProtoItem>,
-    name: Rc<String>,
+pub struct MethodItem<'a> {
+    class: Cow<'a, str>,
+    proto: Rc<ProtoItem<'a>>,
+    name: Cow<'a, str>,
 }
 
 #[derive(Debug)]
-pub struct ClassItem {
-    class: Rc<String>,
+pub struct ClassItem<'a> {
+    class: Cow<'a, str>,
     access_flags: u32,
-    superclass: Option<Rc<String>>,
-    source_file: Option<Rc<String>>,
+    superclass: Option<Cow<'a, str>>,
+    source_file: Option<Cow<'a, str>>,
 }
 
 #[derive(Default)]
@@ -627,8 +683,8 @@ pub struct MapItem {
     offset: u32,
 }
 
-impl From<Dex> for protos::dex::Dex {
-    fn from(dex: Dex) -> Self {
+impl<'a> From<Dex<'a>> for protos::dex::Dex {
+    fn from(dex: Dex<'a>) -> Self {
         let mut result = protos::dex::Dex::new();
 
         result.set_is_dex(true);
@@ -636,8 +692,10 @@ impl From<Dex> for protos::dex::Dex {
 
         result
             .strings
-            .extend(dex.strings.into_iter().map(|x| x.as_ref().clone()));
-        result.types.extend(dex.types.into_iter().map(|x| x.as_ref().clone()));
+            .extend(dex.strings.into_iter().map(|x| x.to_string()));
+        result
+            .types
+            .extend(dex.types.into_iter().map(|x| x.to_string()));
         result.protos.extend(
             dex.protos
                 .iter()
@@ -680,8 +738,8 @@ impl From<DexHeader> for protos::dex::DexHeader {
     }
 }
 
-impl From<&ProtoItem> for protos::dex::ProtoItem {
-    fn from(value: &ProtoItem) -> Self {
+impl<'a> From<&ProtoItem<'a>> for protos::dex::ProtoItem {
+    fn from(value: &ProtoItem<'a>) -> Self {
         let mut result = protos::dex::ProtoItem::new();
 
         result.shorty = Some(value.shorty.to_string());
@@ -689,14 +747,14 @@ impl From<&ProtoItem> for protos::dex::ProtoItem {
         result.set_parameters_count(value.parameters_count);
         result
             .parameters
-            .extend(value.parameters.iter().map(|x| x.as_ref().into()));
+            .extend(value.parameters.iter().map(|x| x.to_string()));
 
         result
     }
 }
 
-impl From<&FieldItem> for protos::dex::FieldItem {
-    fn from(value: &FieldItem) -> Self {
+impl<'a> From<&FieldItem<'a>> for protos::dex::FieldItem {
+    fn from(value: &FieldItem<'a>) -> Self {
         let mut result = protos::dex::FieldItem::new();
 
         result.class = Some(value.class.to_string());
@@ -707,8 +765,8 @@ impl From<&FieldItem> for protos::dex::FieldItem {
     }
 }
 
-impl From<&MethodItem> for protos::dex::MethodItem {
-    fn from(value: &MethodItem) -> Self {
+impl<'a> From<&MethodItem<'a>> for protos::dex::MethodItem {
+    fn from(value: &MethodItem<'a>) -> Self {
         let mut result = protos::dex::MethodItem::new();
 
         result.class = Some(value.class.to_string());
@@ -719,8 +777,8 @@ impl From<&MethodItem> for protos::dex::MethodItem {
     }
 }
 
-impl From<&ClassItem> for protos::dex::ClassItem {
-    fn from(value: &ClassItem) -> Self {
+impl<'a> From<&ClassItem<'a>> for protos::dex::ClassItem {
+    fn from(value: &ClassItem<'a>) -> Self {
         let mut result = protos::dex::ClassItem::new();
 
         result.class = Some(value.class.to_string());
