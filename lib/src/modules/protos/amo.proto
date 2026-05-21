@@ -7,7 +7,6 @@ package amo;
 option (yara.module_options) = {
   name : "amo"
   root_message: "amo.AMO"
-  rust_module: "amo"
   cargo_feature: "amo-module"
 };
 

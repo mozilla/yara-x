@@ -128,8 +128,8 @@ impl ::protobuf::reflect::ProtobufValue for AMO {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\tamo.proto\x12\x03amo\x1a\nyara.proto\"\x05\n\x03AMOB#\xfa\x92\x19\
-    \x1f\n\x03amo\x12\x07amo.AMO\x1a\x03amo\"\namo-moduleb\x06proto2\
+    \n\tamo.proto\x12\x03amo\x1a\nyara.proto\"\x05\n\x03AMOB\x1e\xfa\x92\x19\
+    \x1a\n\x03amo\x12\x07amo.AMO\x1a\namo-moduleb\x06proto2\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
