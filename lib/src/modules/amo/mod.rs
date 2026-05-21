@@ -2,7 +2,7 @@ use serde_json_path::JsonPath;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::modules::prelude::*;
+use crate::mods::prelude::*;
 use crate::modules::protos::amo::*;
 
 thread_local! {
@@ -24,7 +24,6 @@ struct ConfigJson {
     pub manifest: serde_json::Value,
 }
 
-#[module_main]
 fn main(_data: &[u8], meta: Option<&[u8]>) -> Result<AMO, ModuleError> {
     let meta = match meta {
         None | Some([]) => {
@@ -196,3 +195,5 @@ mod test {
         );
     }
 }
+
+register_module!("amo", AMO, main);
