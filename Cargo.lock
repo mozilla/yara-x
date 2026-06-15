@@ -888,9 +888,9 @@ dependencies = [
 
 [[package]]
 name = "daachorse"
-version = "3.0.0"
+version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d87f75bbe32ee10609201e09e818537df81c3acb436be2b78f47cc85d139475"
+checksum = "99251f238b74cd219a86fe6ea9328308ebb223fcbb5b8eb5aa400b847a41dded"
 
 [[package]]
 name = "darling"
@@ -2535,14 +2535,14 @@ dependencies = [
 
 [[package]]
 name = "pyo3"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91fd8e38a3b50ed1167fb981cd6fd60147e091784c427b8f7183a7ee32c31c12"
+checksum = "cd274650b21d4bfc26a0a47587962c1edb425f69287324355cd040c3ea66071c"
 dependencies = [
  "libc",
  "once_cell",
  "portable-atomic",
- "pyo3-build-config",
+ "pyo3-build-config 0.29.0",
  "pyo3-ffi",
  "pyo3-macros",
 ]
@@ -2557,20 +2557,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "pyo3-ffi"
-version = "0.28.3"
+name = "pyo3-build-config"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f29e10af80b1f7ccaf7f69eace800a03ecd13e883acfacc1e5d0988605f651e"
+checksum = "c5e2a7d2f0d013342f295c048ad19237add5154a55b1c5a254c0ec93d4109078"
+dependencies = [
+ "target-lexicon",
+]
+
+[[package]]
+name = "pyo3-ffi"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca85c467da1bbc8d866eea5deff9cf29ea5f7785054a17da36e65bda9c05845b"
 dependencies = [
  "libc",
- "pyo3-build-config",
+ "pyo3-build-config 0.29.0",
 ]
 
 [[package]]
 name = "pyo3-macros"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df6e520eff47c45997d2fc7dd8214b25dd1310918bbb2642156ef66a67f29813"
+checksum = "9ac53762fd065daa3194dd09337a38bd793a188100fd1a9304c4ab312d901771"
 dependencies = [
  "proc-macro2",
  "pyo3-macros-backend",
@@ -2580,13 +2589,12 @@ dependencies = [
 
 [[package]]
 name = "pyo3-macros-backend"
-version = "0.28.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4cdc218d835738f81c2338f822078af45b4afdf8b2e33cbb5916f108b813acb"
+checksum = "4ca3a1557399783172dc5bf39cfca835157732532cba56b71d2292161e53b362"
 dependencies = [
  "heck",
  "proc-macro2",
- "pyo3-build-config",
  "quote",
  "syn",
 ]
@@ -4398,7 +4406,7 @@ dependencies = [
 
 [[package]]
 name = "yara-x"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
@@ -4468,13 +4476,12 @@ dependencies = [
  "yara-x-macros",
  "yara-x-parser",
  "yara-x-proto",
- "yara-x-proto-yaml",
  "zip",
 ]
 
 [[package]]
 name = "yara-x-capi"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "assert-call",
  "cbindgen",
@@ -4484,7 +4491,7 @@ dependencies = [
 
 [[package]]
 name = "yara-x-cli"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "anyhow",
  "ascii_tree",
@@ -4518,13 +4525,12 @@ dependencies = [
  "yara-x",
  "yara-x-fmt",
  "yara-x-parser",
- "yara-x-proto-json",
- "yara-x-proto-yaml",
+ "yara-x-proto",
 ]
 
 [[package]]
 name = "yara-x-fmt"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "bitflags 2.11.1",
  "bstr",
@@ -4538,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "yara-x-js"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "getrandom 0.2.17",
  "js-sys",
@@ -4554,7 +4560,7 @@ dependencies = [
 
 [[package]]
 name = "yara-x-ls"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "async-lsp",
  "bitflags 2.11.1",
@@ -4584,7 +4590,7 @@ dependencies = [
 
 [[package]]
 name = "yara-x-macros"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -4594,7 +4600,7 @@ dependencies = [
 
 [[package]]
 name = "yara-x-parser"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "anyhow",
  "ascii_tree",
@@ -4617,30 +4623,9 @@ dependencies = [
 
 [[package]]
 name = "yara-x-proto"
-version = "1.17.0"
-dependencies = [
- "protobuf",
- "protobuf-codegen",
-]
-
-[[package]]
-name = "yara-x-proto-json"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "base64",
- "globwalk",
- "goldenfile",
- "itertools 0.14.0",
- "protobuf",
- "protobuf-codegen",
- "yansi",
- "yara-x-proto",
-]
-
-[[package]]
-name = "yara-x-proto-yaml"
-version = "1.17.0"
-dependencies = [
  "chrono",
  "globwalk",
  "goldenfile",
@@ -4648,17 +4633,16 @@ dependencies = [
  "protobuf",
  "protobuf-codegen",
  "yansi",
- "yara-x-proto",
 ]
 
 [[package]]
 name = "yara-x-py"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "base64",
  "protobuf",
  "pyo3",
- "pyo3-build-config",
+ "pyo3-build-config 0.28.3",
  "regex",
  "serde_json",
  "strum",
@@ -4666,7 +4650,7 @@ dependencies = [
  "yara-x",
  "yara-x-fmt",
  "yara-x-parser",
- "yara-x-proto-json",
+ "yara-x-proto",
 ]
 
 [[package]]
