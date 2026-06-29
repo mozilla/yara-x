@@ -24,8 +24,8 @@ struct ConfigJson {
     pub manifest: serde_json::Value,
 }
 
-fn main(_data: &[u8], meta: Option<&[u8]>) -> Result<AMO, ModuleError> {
-    let meta = match meta {
+fn main(ctx: &mut ModuleContext, _data: &[u8]) -> Result<AMO, ModuleError> {
+    let meta = match ctx.get_module_metadata("amo") {
         None | Some([]) => {
             set_local(ConfigJson::default());
             return Ok(AMO::new());
