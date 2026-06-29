@@ -23,6 +23,8 @@ mod macho;
 mod magic;
 #[cfg(feature = "math-module")]
 mod math;
+#[cfg(feature = "olecf-module")]
+mod olecf;
 #[cfg(feature = "pe-module")]
 mod pe;
 #[cfg(feature = "string-module")]
@@ -33,5 +35,9 @@ mod test_proto2;
 mod test_proto3;
 #[cfg(feature = "time-module")]
 mod time;
+#[cfg(feature = "vba-module")]
+mod vba;
 #[cfg(feature = "vt-module")]
 mod vt;
+#[cfg(feature = "zip-module")]
+mod zip;

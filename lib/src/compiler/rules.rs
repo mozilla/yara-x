@@ -119,6 +119,17 @@ pub struct Rules {
     pub(in crate::compiler) filesize_bounds:
         FxHashMap<PatternId, FilesizeBounds>,
 
+    /// Map that associates a `PatternId` to a certain constraint on the
+    /// file header (e.g. magic bytes at offset 0), if any.
+    ///
+    /// A condition like `uint16(0) == 0x5A4D and $a` or `$mz at 0 and $a`
+    /// (where $mz = "MZ") only matches if the file starts with "MZ" (0x5A4D).
+    /// In this case, the map will contain an entry associating `$a` to a
+    /// `HeaderConstraint` that requires the file to start with those two
+    /// bytes.
+    ///
+    /// This allows skipping pattern checks entirely if the scanned data
+    /// doesn't start with the expected header prefix.
     pub(in crate::compiler) header_constraints:
         FxHashMap<PatternId, HeaderConstraint>,
 
@@ -207,6 +218,14 @@ impl Rules {
 
     /// Deserializes the rules from a sequence of bytes produced by
     /// [`Rules::serialize`].
+    ///
+    /// # Safety
+    ///
+    /// As long as you are deserializing rules from binary content produced
+    /// by [`Rules::serialize`] you are safe. But you should never attempt
+    /// to do so from binary content that was produced or could be manipulated
+    /// by a third party. This implies a security risk and your program may
+    /// panic during scanning.
     pub fn deserialize<B>(bytes: B) -> Result<Self, SerializationError>
     where
         B: AsRef<[u8]>,
@@ -272,6 +291,21 @@ impl Rules {
         }
 
         rules.build_ac_automaton();
+
+        // Make sure that the maximum SubPatternId is within the boundaries
+        // of sub_patterns array. This check is important because during
+        // the scanning phase we use SubPatternId as indexes in the array
+        // without boundary checks for better performance.
+        let max_sub_pattern_id = rules
+            .atoms
+            .iter()
+            .map(|atom| atom.sub_pattern_id)
+            .max()
+            .unwrap_or(SubPatternId(0));
+
+        if rules.sub_patterns.len() < max_sub_pattern_id.0 as usize {
+            return Err(SerializationError::InvalidFormat);
+        }
 
         Ok(rules)
     }
