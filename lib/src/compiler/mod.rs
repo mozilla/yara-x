@@ -1241,8 +1241,13 @@ impl Compiler<'_> {
             .retain(|pattern_id, _| *pattern_id < snapshot.next_pattern_id);
     }
 
-    /// Returns true if the bytes in the slice are all 0x00, 0x90, or 0xff.
-    fn common_byte_repetition(bytes: &[u8]) -> bool {
+    /// Returns true if the slice contains a single byte, or if the bytes in
+    /// the slice are all 0x00, 0x90, or 0xff.
+    fn is_slow_pattern_bytes(bytes: &[u8]) -> bool {
+        if bytes.len() == 1 {
+            return true;
+        }
+
         let mut all_x00 = true;
         let mut all_x90 = true;
         let mut all_xff = true;
@@ -1268,7 +1273,7 @@ impl Compiler<'_> {
             }
         }
 
-        true
+        !bytes.is_empty()
     }
 
     /// Reads the file specified by an `include` statement.
@@ -1611,16 +1616,26 @@ impl Compiler<'_> {
                     Pattern::Hex(re) => re.hir.as_literal_bytes(),
                 };
                 if let Some(literal_bytes) = literal_bytes
-                    && Self::common_byte_repetition(literal_bytes)
+                    && Self::is_slow_pattern_bytes(literal_bytes)
                 {
-                    self.warnings.add(|| {
-                        warnings::SlowPattern::build(
+                    if self.error_on_slow_pattern {
+                        self.restore_snapshot(snapshot);
+                        return Err(errors::SlowPattern::build(
                             &self.report_builder,
                             self.report_builder
                                 .span_to_code_loc(pat.span().clone()),
                             None,
-                        )
-                    });
+                        ));
+                    } else {
+                        self.warnings.add(|| {
+                            warnings::SlowPattern::build(
+                                &self.report_builder,
+                                self.report_builder
+                                    .span_to_code_loc(pat.span().clone()),
+                                None,
+                            )
+                        });
+                    }
                 }
             }
         }
@@ -1689,13 +1704,7 @@ impl Compiler<'_> {
         // Analyze the condition and determine if it imposes some constraint
         // to the file header (ex: `uint16(0) == 0x5a4d`).
         let header_constraints = self.ir.header_constraints(|pat_idx| {
-            let pat = &rule_patterns[pat_idx.as_usize()];
-            match pat.pattern() {
-                Pattern::Text(lit) => Some(lit.text.as_bytes().to_vec()),
-                Pattern::Regexp(re) | Pattern::Hex(re) => {
-                    re.hir.as_literal_bytes().map(|bytes| bytes.to_vec())
-                }
-            }
+            rule_patterns[pat_idx.as_usize()].pattern()
         });
 
         // Set the bounds to all patterns in the rule. This must be done
@@ -1913,8 +1922,7 @@ impl Compiler<'_> {
 
     fn c_import(&mut self, import: &Import) -> Result<(), CompileError> {
         let module_name = import.module_name;
-        let module = crate::modules::registered_modules()
-            .find(|m| m.name() == module_name);
+        let module = crate::modules::module_by_name(module_name);
 
         // Does a module with the given name actually exist? ...
         if module.is_none() {
@@ -2924,7 +2932,18 @@ impl From<PatternId> for usize {
 /// For each pattern there's one or more sub-patterns, depending on the pattern
 /// and its modifiers. For example the pattern `"foo" ascii wide` may have one
 /// subpattern for the ascii case and another one for the wide case.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Eq,
+    Hash,
+    PartialEq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+)]
 #[serde(transparent)]
 pub(crate) struct SubPatternId(u32);
 

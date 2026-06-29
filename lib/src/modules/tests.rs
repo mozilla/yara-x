@@ -138,6 +138,11 @@ fn test_modules() {
             .map(|s| s.as_os_str().to_str().unwrap())
             .expect("can not extract module name from tests path");
 
+        // Ignore the module of not among the registered modules.
+        if !module_names().any(|n| n == module_name) {
+            return;
+        }
+
         // Construct a dummy YARA rule that only imports the module.
         let rule = format!(
             r#"import "{module_name}" rule test {{ condition: false }}"#
@@ -164,12 +169,13 @@ fn test_modules() {
                 panic!("module `{module_name}` should produce some output")
             });
 
-        let output_file = mint.new_goldenfile(out_path).unwrap();
+        let output_file =
+            mint.new_goldenfile(out_path).expect("can not create goldenfile");
 
         // Render the module's output as YAML.
         let mut yaml = yara_x_proto::yaml::Serializer::new(output_file);
 
-        yaml.serialize(output).unwrap();
+        assert!(yaml.serialize(output).is_ok());
     });
 }
 
