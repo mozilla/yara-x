@@ -160,12 +160,12 @@ pub(in crate::compiler) fn text_pattern_from_ast<'src>(
 
     let mut flags = PatternFlags::empty();
 
-    if ascii.is_some() || wide.is_none() {
-        flags.insert(PatternFlags::Ascii);
-    }
-
     if wide.is_some() {
-        flags.insert(PatternFlags::Wide);
+        if ascii.is_some() {
+            flags.insert(PatternFlags::WideAndAscii);
+        } else {
+            flags.insert(PatternFlags::WideOnly);
+        }
     }
 
     if nocase.is_some() {
@@ -283,10 +283,13 @@ pub(in crate::compiler) fn hex_pattern_from_ast<'src>(
     ctx: &mut CompileContext,
     pattern: &ast::HexPattern<'src>,
 ) -> Result<PatternInRule<'src>, CompileError> {
-    // The only modifier accepted by hex patterns is `private`.
+    let mut pattern_flags = PatternFlags::empty();
     for modifier in pattern.modifiers.iter() {
         match modifier {
-            ast::PatternModifier::Private { .. } => {}
+            // The only modifier accepted by hex patterns is `private`.
+            ast::PatternModifier::Private { .. } => {
+                pattern_flags |= PatternFlags::Private;
+            }
             _ => {
                 return Err(InvalidModifier::build(
                     ctx.report_builder,
@@ -326,7 +329,7 @@ pub(in crate::compiler) fn hex_pattern_from_ast<'src>(
         fast_scan_allowed: true,
         pattern: Pattern::Hex(RegexpPattern {
             hir,
-            flags: PatternFlags::Ascii,
+            flags: pattern_flags,
             anchored_at: None,
             filesize_bounds: FilesizeBounds::default(),
             header_constraints: HeaderConstraint::default(),
@@ -374,18 +377,20 @@ pub(in crate::compiler) fn regexp_pattern_from_ast<'src>(
 
     let mut flags = PatternFlags::empty();
 
-    if pattern.modifiers.ascii().is_some()
-        || pattern.modifiers.wide().is_none()
-    {
-        flags |= PatternFlags::Ascii;
-    }
-
     if pattern.modifiers.wide().is_some() {
-        flags |= PatternFlags::Wide;
+        if pattern.modifiers.ascii().is_some() {
+            flags |= PatternFlags::WideAndAscii;
+        } else {
+            flags |= PatternFlags::WideOnly;
+        }
     }
 
     if pattern.modifiers.fullword().is_some() {
         flags |= PatternFlags::Fullword;
+    }
+
+    if pattern.modifiers.private().is_some() {
+        flags |= PatternFlags::Private;
     }
 
     // A regexp pattern can use either the `nocase` modifier or the `/i`
