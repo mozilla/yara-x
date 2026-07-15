@@ -1,9 +1,22 @@
-export type ResultTone = "idle" | "clean" | "match" | "warning" | "issues";
+export type ResultMode = "summary" | "raw" | "console";
+
+export type ResultTone =
+  | "idle"
+  | "clean"
+  | "match"
+  | "warning"
+  | "issues"
+  | "cancelled";
 
 export type PatternSummary = {
   identifier: string;
   hits: number;
-  ranges: string[];
+  ranges: MatchRange[];
+};
+
+export type MatchRange = {
+  start: number;
+  end: number;
 };
 
 export type RuleSummary = {
@@ -25,4 +38,11 @@ export type ResultSummary = {
   warningsList: string[];
   matchingRules: RuleSummary[];
   nonMatchingRules: string[];
+};
+
+export type ExecutionState = {
+  raw: unknown;
+  consoleOutput: string[];
+  durationMs: number | null;
+  summary: ResultSummary;
 };
