@@ -1,3 +1,4 @@
+use std::collections::hash_map;
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
 use std::ops::{Bound, RangeBounds};
@@ -669,17 +670,15 @@ impl Rules {
     #[inline]
     pub(crate) fn filesize_bounds(
         &self,
-        pattern_id: PatternId,
-    ) -> Option<&FilesizeBounds> {
-        self.filesize_bounds.get(&pattern_id)
+    ) -> hash_map::Iter<'_, PatternId, FilesizeBounds> {
+        self.filesize_bounds.iter()
     }
 
     #[inline]
     pub(crate) fn header_constraints(
         &self,
-        pattern_id: PatternId,
-    ) -> Option<&HeaderConstraint> {
-        self.header_constraints.get(&pattern_id)
+    ) -> hash_map::Iter<'_, PatternId, HeaderConstraint> {
+        self.header_constraints.iter()
     }
 
     #[inline]

@@ -903,6 +903,20 @@ impl ScanContext<'_, '_> {
                 );
             }
 
+            #[cfg(feature = "rules-profiling")]
+            {
+                let time_spent = self
+                    .clock
+                    .delta_as_nanos(verification_start, self.clock.raw());
+
+                self.time_spent_in_pattern
+                    .entry(*pattern_id)
+                    .and_modify(|t| {
+                        t.add_assign(time_spent);
+                    })
+                    .or_insert(time_spent);
+            }
+
             return;
         }
 
@@ -1102,6 +1116,9 @@ impl ScanContext<'_, '_> {
     /// In case of timeout, this function returns [ScanError::Timeout] and sets
     /// the scan state to [ScanState::Timeout].
     pub(crate) fn search_for_patterns(&mut self) -> Result<(), ScanError> {
+        #[cfg(any(feature = "rules-profiling", feature = "logging"))]
+        let scan_start = self.clock.raw();
+
         // Take ownership of the scan state, while searching for
         // the patterns, `self.scan_state` is left as `Idle`.
         let state = self.scan_state.take();
@@ -1114,31 +1131,22 @@ impl ScanContext<'_, '_> {
 
         if !block_scanning_mode {
             let filesize = self.get_filesize();
-            for pattern_id in 0..self.compiled_rules.num_patterns() {
-                let pattern_id = PatternId::from(pattern_id);
-                if let Some(bounds) =
-                    self.compiled_rules.filesize_bounds(pattern_id)
-                    && !bounds.contains(filesize)
-                {
-                    self.tracker.disabled_patterns.insert(pattern_id);
+            for (pattern_id, bounds) in self.compiled_rules.filesize_bounds() {
+                if !bounds.contains(filesize) {
+                    self.tracker.disabled_patterns.insert(*pattern_id);
                 }
             }
         }
 
         if base == 0 {
-            for pattern_id in 0..self.compiled_rules.num_patterns() {
-                let pattern_id = PatternId::from(pattern_id);
-                if let Some(constraints) =
-                    self.compiled_rules.header_constraints(pattern_id)
-                    && !constraints.is_satisfied(data)
-                {
-                    self.tracker.disabled_patterns.insert(pattern_id);
+            for (pattern_id, constraints) in
+                self.compiled_rules.header_constraints()
+            {
+                if !constraints.is_satisfied(data) {
+                    self.tracker.disabled_patterns.insert(*pattern_id);
                 }
             }
         }
-
-        #[cfg(any(feature = "rules-profiling", feature = "logging"))]
-        let scan_start = self.clock.raw();
 
         // Verify the anchored pattern first. These are patterns that can
         // match at a single known offset within the data.
