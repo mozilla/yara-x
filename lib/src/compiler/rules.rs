@@ -952,6 +952,13 @@ impl FilesizeBounds {
         }
         self
     }
+
+    /// Merges another set of filesize bounds into this one (intersection).
+    pub fn merge(&mut self, other: &Self) -> &mut Self {
+        self.max_start(other.start);
+        self.min_end(other.end);
+        self
+    }
 }
 
 /// Describes the requirements on the file header imposed by a rule condition.
@@ -978,6 +985,28 @@ impl HeaderConstraint {
             Self::Unconstrained => true,
             Self::Unsatisfiable => false,
             Self::Constrained(bytes) => data.starts_with(bytes),
+        }
+    }
+
+    /// Merges another header constraint into this one (intersection).
+    pub fn merge(&mut self, other: &Self) {
+        match (&self, other) {
+            (Self::Unsatisfiable, _) => {}
+            (_, Self::Unsatisfiable) => {
+                *self = Self::Unsatisfiable;
+            }
+            (Self::Unconstrained, _) => {
+                *self = other.clone();
+            }
+            (_, Self::Unconstrained) => {}
+            (Self::Constrained(a), Self::Constrained(b)) => {
+                let min_len = a.len().min(b.len());
+                if a[..min_len] != b[..min_len] {
+                    *self = Self::Unsatisfiable;
+                } else if b.len() > a.len() {
+                    *self = other.clone();
+                }
+            }
         }
     }
 }
@@ -1053,5 +1082,108 @@ impl SubPatternAtom {
     #[inline]
     pub(crate) fn bck_code(&self) -> Option<BckCodeLoc> {
         self.bck_code
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HeaderConstraint;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn header_constraint_merge() {
+        let merge = |mut a: HeaderConstraint, b: &HeaderConstraint| {
+            a.merge(b);
+            a
+        };
+
+        let unconstrained = HeaderConstraint::Unconstrained;
+        let unsatisfiable = HeaderConstraint::Unsatisfiable;
+        let constrained =
+            |bytes: &[u8]| HeaderConstraint::Constrained(bytes.to_vec());
+
+        // (Unsatisfiable, _) => Unsatisfiable
+        assert_eq!(
+            merge(unsatisfiable.clone(), &unsatisfiable),
+            unsatisfiable
+        );
+        assert_eq!(
+            merge(unsatisfiable.clone(), &unconstrained),
+            unsatisfiable
+        );
+        assert_eq!(
+            merge(unsatisfiable.clone(), &constrained(&[0x4D, 0x5A])),
+            unsatisfiable
+        );
+
+        // (_, Unsatisfiable) => Unsatisfiable
+        assert_eq!(
+            merge(unconstrained.clone(), &unsatisfiable),
+            unsatisfiable
+        );
+        assert_eq!(
+            merge(constrained(&[0x4D, 0x5A]), &unsatisfiable),
+            unsatisfiable
+        );
+
+        // (Unconstrained, _) => other
+        assert_eq!(
+            merge(unconstrained.clone(), &unconstrained),
+            unconstrained
+        );
+        assert_eq!(
+            merge(unconstrained.clone(), &constrained(&[0x4D, 0x5A])),
+            constrained(&[0x4D, 0x5A])
+        );
+
+        // (_, Unconstrained) => self
+        assert_eq!(
+            merge(constrained(&[0x4D, 0x5A]), &unconstrained),
+            constrained(&[0x4D, 0x5A])
+        );
+
+        // (Constrained(a), Constrained(b)) where a == b
+        assert_eq!(
+            merge(constrained(&[0x4D, 0x5A]), &constrained(&[0x4D, 0x5A])),
+            constrained(&[0x4D, 0x5A])
+        );
+
+        // (Constrained(a), Constrained(b)) where a is a prefix of b (b.len() > a.len())
+        assert_eq!(
+            merge(
+                constrained(&[0x4D, 0x5A]),
+                &constrained(&[0x4D, 0x5A, 0x90])
+            ),
+            constrained(&[0x4D, 0x5A, 0x90])
+        );
+
+        // (Constrained(a), Constrained(b)) where b is a prefix of a (a.len() > b.len())
+        assert_eq!(
+            merge(
+                constrained(&[0x4D, 0x5A, 0x90]),
+                &constrained(&[0x4D, 0x5A])
+            ),
+            constrained(&[0x4D, 0x5A, 0x90])
+        );
+
+        // (Constrained(a), Constrained(b)) with conflicting prefixes
+        assert_eq!(
+            merge(constrained(&[0x4D, 0x5A]), &constrained(&[0x4D, 0x00])),
+            unsatisfiable
+        );
+        assert_eq!(
+            merge(
+                constrained(&[0x4D, 0x5A]),
+                &constrained(&[0x7F, 0x45, 0x4C, 0x46])
+            ),
+            unsatisfiable
+        );
+        assert_eq!(
+            merge(
+                constrained(&[0x7F, 0x45, 0x4C, 0x46]),
+                &constrained(&[0x4D, 0x5A])
+            ),
+            unsatisfiable
+        );
     }
 }
