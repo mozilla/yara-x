@@ -658,7 +658,7 @@ impl ScanContext<'_, '_> {
                         thread::sleep(Duration::from_secs(1));
                         wasm::get_engine().increment_epoch();
                         HEARTBEAT_COUNTER
-                            .fetch_update(
+                            .try_update(
                                 Ordering::SeqCst,
                                 Ordering::SeqCst,
                                 |x| Some(x + 1),
@@ -1976,7 +1976,7 @@ fn track_match(
     match tracker.pattern_matches.add(pattern_id, match_, replace_if_longer) {
         AddResult::Inserted(current_matches) => {
             #[cfg(feature = "logging")]
-            if current_matches % 10 == 0 {
+            if current_matches % 100_000 == 0 {
                 let (rule, pattern) = tracker
                     .compiled_rules
                     .get_rule_and_pattern_by_pattern_id(pattern_id)
