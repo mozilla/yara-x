@@ -995,16 +995,139 @@ fn regex_set_optimization() {
                 test_proto2.string_foo matches /foo/ or
                 test_proto2.string_foo matches /bar/
         }
+        rule test_eq_true {
+            condition:
+                test_proto2.string_foo == "bar" or
+                test_proto2.string_foo == "foo"
+        }
+        rule test_eq_commuted_true {
+            condition:
+                "bar" == test_proto2.string_foo or
+                "foo" == test_proto2.string_foo
+        }
+        rule test_eq_false_partial {
+            condition:
+                test_proto2.string_foo == "fo" or
+                test_proto2.string_foo == "oo"
+        }
+        rule test_eq_false_case {
+            condition:
+                test_proto2.string_foo == "FOO" or
+                test_proto2.string_foo == "BAR"
+        }
+        rule test_iequals_true {
+            condition:
+                test_proto2.string_foo iequals "BAR" or
+                "FOO" iequals test_proto2.string_foo
+        }
+        rule test_iequals_false_partial {
+            condition:
+                test_proto2.string_foo iequals "FO" or
+                test_proto2.string_foo iequals "OO"
+        }
+        rule test_contains_true {
+            condition:
+                test_proto2.string_foo contains "ba" or
+                test_proto2.string_foo contains "oo"
+        }
+        rule test_contains_false {
+            condition:
+                test_proto2.string_foo contains "FO" or
+                test_proto2.string_foo contains "BA"
+        }
+        rule test_icontains_true {
+            condition:
+                test_proto2.string_foo icontains "BA" or
+                test_proto2.string_foo icontains "OO"
+        }
+        rule test_startswith_true {
+            condition:
+                test_proto2.string_foo startswith "ba" or
+                test_proto2.string_foo startswith "fo"
+        }
+        rule test_startswith_false {
+            condition:
+                test_proto2.string_foo startswith "oo" or
+                test_proto2.string_foo startswith "FO"
+        }
+        rule test_istartswith_true {
+            condition:
+                test_proto2.string_foo istartswith "BA" or
+                test_proto2.string_foo istartswith "FO"
+        }
+        rule test_istartswith_false {
+            condition:
+                test_proto2.string_foo istartswith "OO" or
+                test_proto2.string_foo istartswith "AR"
+        }
+        rule test_endswith_true {
+            condition:
+                test_proto2.string_foo endswith "ar" or
+                test_proto2.string_foo endswith "oo"
+        }
+        rule test_endswith_false {
+            condition:
+                test_proto2.string_foo endswith "fo" or
+                test_proto2.string_foo endswith "OO"
+        }
+        rule test_iendswith_true {
+            condition:
+                test_proto2.string_foo iendswith "AR" or
+                test_proto2.string_foo iendswith "OO"
+        }
+        rule test_iendswith_false {
+            condition:
+                test_proto2.string_foo iendswith "FO" or
+                test_proto2.string_foo iendswith "BA"
+        }
+        rule test_mixed_true {
+            condition:
+                test_proto2.string_foo == "nope" or
+                test_proto2.string_foo startswith "ba" or
+                test_proto2.string_foo matches /b.r/ or
+                test_proto2.string_foo iendswith "OO"
+        }
+        rule test_special_chars_true {
+            condition:
+                test_proto2.head(10) == "other" or
+                test_proto2.head(10) == "a+b/c\nd\x00\xff*"
+        }
+        rule test_special_chars_multiline_anchor_false {
+            condition:
+                test_proto2.head(10) == "a+b/c" or
+                test_proto2.head(10) == "d\x00\xff*"
+        }
+        rule test_undef_false {
+            condition:
+                test_proto2.string_undef == "foo" or
+                test_proto2.string_undef contains "bar"
+        }
         "#,
     )
     .unwrap();
 
     let mut scanner = crate::Scanner::new(&rules);
-    let results = scanner.scan(b"").unwrap();
+    let results = scanner.scan(b"a+b/c\nd\x00\xff*").unwrap();
 
     let matching_rules: Vec<_> =
         results.matching_rules().map(|r| r.identifier().to_string()).collect();
-    assert_eq!(matching_rules, vec!["test_match"]);
+    assert_eq!(
+        matching_rules,
+        vec![
+            "test_match",
+            "test_eq_true",
+            "test_eq_commuted_true",
+            "test_iequals_true",
+            "test_contains_true",
+            "test_icontains_true",
+            "test_startswith_true",
+            "test_istartswith_true",
+            "test_endswith_true",
+            "test_iendswith_true",
+            "test_mixed_true",
+            "test_special_chars_true",
+        ]
+    );
 }
 
 #[test]
@@ -1188,28 +1311,39 @@ fn test_slow_rule_hang() {
 }
 
 #[test]
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "sse2"),
+    all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )
+))]
 fn test_teddy_scan_timeout() {
+    use std::fmt::Write;
     use std::time::Duration;
 
-    let rules = crate::compile(
-        r#"
-        rule test {
-            strings:
-                $a = "abcd"
-            condition:
-                $a
-        }
-        "#,
-    )
-    .unwrap();
+    // Build a rule with 64 distinct literal patterns (the maximum number of
+    // patterns supported by Teddy) that all share the 4-byte atom `"aaaa"`.
+    // All 64 atoms hash to the same Teddy bucket, so scanning a buffer of `'a'`
+    // bytes triggers 64 Teddy atom matches per byte while failing literal
+    // verification on the trailing `\x00` bytes (which prevents the patterns
+    // from reaching `max_matches_per_pattern` and being disabled).
+    let mut rule = String::from("rule test { strings:\n");
+    for i in 1..=64 {
+        writeln!(rule, r#"$ = "aaaa{}""#, "\\x00".repeat(i)).unwrap();
+    }
+    rule.push_str("condition: any of them }");
+
+    let rules = crate::compile(rule.as_str()).unwrap();
+
+    assert_eq!(rules.atoms.len(), 64);
+    assert!(rules.ac_automaton().teddy.is_some());
 
     let mut scanner = Scanner::new(&rules);
     scanner.set_timeout(Duration::from_secs(1));
 
-    let mut data = Vec::with_capacity(40_000_000);
-    for _ in 0..10_000_000 {
-        data.extend_from_slice(b"abcd");
-    }
+    let data = vec![b'a'; 10_000_000];
 
     let err = scanner.scan(&data).unwrap_err();
     assert_eq!(err.to_string(), "timeout");

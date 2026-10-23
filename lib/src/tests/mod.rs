@@ -287,6 +287,17 @@ fn string_operations() {
     condition_true!(r#""foo" istartswith "Fo""#);
     condition_true!(r#""foo" iendswith "OO""#);
 
+    // Some non-ASCII characters are lowercased to ASCII (U+212A KELVIN SIGN
+    // -> 'k', 'İ' -> "i\u{307}"), or change their length in bytes ('Ⱥ' -> 'ⱥ'
+    // goes from 2 to 3 bytes).
+    condition_true!(r#""\xE2\x84\xAAelvin" istartswith "kel""#);
+    condition_true!(r#""İstanbul" istartswith "i""#);
+    condition_true!(r#""Ⱥ" istartswith "ⱥ""#);
+    condition_true!(r#""ABC\xE2\x84\xAA" iendswith "k""#);
+    condition_true!(r#""x\xE2\x84\xAAx" icontains "k""#);
+    condition_true!(r#""\xE2\x84\xAA" iequals "k""#);
+    condition_true!(r#""Ⱥ" iequals "ⱥ""#);
+
     condition_false!(r#""foo" contains "OO""#);
     condition_false!(r#""foo" startswith "Fo""#);
     condition_false!(r#""foo" endswith "OO""#);
@@ -3430,8 +3441,21 @@ fn fullword() {
         r#"/ip{2}i/ wide fullword"#,
         b"m\x00i\x00s\x00s\x00i\x00s\x00s\x00i\x00p\x00p\x00i\x00"
     );
-}
 
+    // Regression test: verify_full_word was called with a shadowed sub-slice
+    // of the scanned data (only pattern.len() bytes) instead of the full
+    // scanned data. When the match occurred at a position greater than the
+    // pattern length, this caused an index out-of-bounds panic.
+    //
+    // The regex /\x01\x02.\x04\x05/s with `fullword` is compiled as a
+    // LiteralWithMask sub-pattern. Placing the matching bytes at offset 10
+    // (greater than the pattern length of 5) triggers the bug because
+    // verify_full_word tries to access scanned_data[9] on a 5-byte slice.
+    pattern_true!(
+        r#"/\x01\x02.\x04\x05/s fullword"#,
+        b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05"
+    );
+}
 #[test]
 fn base64() {
     pattern_true!(
