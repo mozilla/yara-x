@@ -287,7 +287,7 @@ pub(crate) fn emit_rule_condition(
     rule_id: RuleId,
     condition: ExprId,
     builder: &mut WasmModuleBuilder,
-) {
+) -> Result<(), wasm::builder::Error> {
     let mut instr = builder.start_rule(rule_id, ctx.current_rule.is_global);
 
     ctx.emit_search_for_pattern_stack.push(true);
@@ -307,7 +307,7 @@ pub(crate) fn emit_rule_condition(
 
     ctx.emit_search_for_pattern_stack.pop();
     assert!(ctx.emit_search_for_pattern_stack.is_empty());
-    builder.finish_rule();
+    builder.finish_rule()
 }
 
 /// Emits WASM code for `expr` into the instruction sequence `instr`.
@@ -686,6 +686,65 @@ fn emit_expr(
             instr.call(ctx.function_id(
                 wasm::export__str_matches_regex_set.mangled_name,
             ));
+        }
+        Expr::EqMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr
+                .call(ctx.function_id(wasm::export__str_eq_many.mangled_name));
+        }
+        Expr::IEqualsMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr.call(
+                ctx.function_id(wasm::export__str_iequals_many.mangled_name),
+            );
+        }
+        Expr::ContainsMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr.call(
+                ctx.function_id(wasm::export__str_contains_many.mangled_name),
+            );
+        }
+        Expr::IContainsMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr.call(
+                ctx.function_id(wasm::export__str_icontains_many.mangled_name),
+            );
+        }
+        Expr::StartsWithMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr.call(
+                ctx.function_id(
+                    wasm::export__str_startswith_many.mangled_name,
+                ),
+            );
+        }
+        Expr::IStartsWithMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr.call(
+                ctx.function_id(
+                    wasm::export__str_istartswith_many.mangled_name,
+                ),
+            );
+        }
+        Expr::EndsWithMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr.call(
+                ctx.function_id(wasm::export__str_endswith_many.mangled_name),
+            );
+        }
+        Expr::IEndsWithMany { lhs, literal_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*literal_set).into());
+            instr.call(
+                ctx.function_id(wasm::export__str_iendswith_many.mangled_name),
+            );
         }
 
         Expr::Lookup(lookup) => {
