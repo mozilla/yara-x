@@ -3448,7 +3448,7 @@ fn eq_check(
         |ctx: &mut CompileContext,
          const_string: Rc<BString>,
          const_string_span: Span,
-         constraints: Box<[StringConstraint]>,
+         constraints: Vec<StringConstraint>,
          constrained_string_span: Span| {
             for constraint in constraints {
                 match constraint {
