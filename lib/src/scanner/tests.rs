@@ -1743,3 +1743,111 @@ fn hoisting_max_vars_and_candidate_limit() {
     assert_eq!(scanner.scan(b"A").unwrap().matching_rules().len(), 1);
     assert_eq!(scanner.scan(b"B").unwrap().matching_rules().len(), 0);
 }
+
+#[test]
+fn non_matching_private_rules() {
+    // Regression test: the number of non-matching private rules was tracked
+    // only for global rules (or with profiling), which made the length of
+    // `non_matching_rules()` wrong and iterating it overflow.
+    let rules = crate::compile(
+        r#"
+        private rule p1 { condition: filesize > 100 }
+        private rule p2 { condition: filesize == 3 }
+        private global rule pg { condition: filesize < 1000 }
+        rule a { condition: filesize > 100 }
+        rule b { condition: true }
+        "#,
+    )
+    .unwrap();
+
+    let mut scanner = Scanner::new(&rules);
+
+    for (data, matching, non_matching) in [
+        (&b"abc"[..], vec!["p2", "pg", "b"], vec!["p1", "a"]),
+        (&[0_u8; 500][..], vec!["p1", "pg", "a", "b"], vec!["p2"]),
+        (&[0_u8; 2000][..], vec![], vec!["p1", "p2", "pg", "a", "b"]),
+    ] {
+        let results = scanner.scan(data).unwrap();
+
+        let m = results.matching_rules().include_private(true);
+        assert_eq!(m.len(), matching.len());
+        assert_eq!(m.map(|r| r.identifier()).collect::<Vec<_>>(), matching);
+
+        let n = results.non_matching_rules().include_private(true);
+        assert_eq!(n.len(), non_matching.len());
+        assert_eq!(
+            n.map(|r| r.identifier()).collect::<Vec<_>>(),
+            non_matching
+        );
+
+        let public: Vec<_> =
+            non_matching.iter().filter(|r| !r.starts_with('p')).collect();
+        let n = results.non_matching_rules();
+        assert_eq!(n.len(), public.len());
+        assert_eq!(n.count(), public.len());
+    }
+}
+
+#[cfg(feature = "pe-module")]
+#[test]
+fn hoisting_nested_field_access_after_lookup() {
+    let mut compiler = crate::Compiler::new();
+    compiler
+        .condition_optimization(true)
+        .add_source(
+            r#"
+            import "pe"
+            rule match_version {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.chain[0].version == 1
+                )
+            }
+            rule mismatch_version {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.chain[0].version == 2
+                )
+            }
+            rule match_program_name_len {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.program_name.len() == 1
+                )
+            }
+            rule mismatch_program_name_len {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.program_name.len() == 2
+                )
+            }
+            "#,
+        )
+        .unwrap();
+
+    let rules = compiler.build();
+
+    let mut cert = mods::pe::Certificate::new();
+    cert.set_version(1);
+
+    let mut signer_info = mods::pe::SignerInfo::new();
+    signer_info.set_program_name("a".to_string());
+    signer_info.chain.push(cert);
+
+    let mut sig = mods::pe::Signature::new();
+    sig.signer_info = protobuf::MessageField::some(signer_info);
+
+    let mut pe = Box::new(mods::PE::new());
+    pe.set_is_pe(true);
+    pe.set_number_of_signatures(1);
+    pe.signatures.push(sig);
+
+    let mut scanner = Scanner::new(&rules);
+    scanner.set_module_output(pe).unwrap();
+    let results = scanner.scan(b"").unwrap();
+
+    assert_eq!(
+        results.matching_rules().map(|r| r.identifier()).collect::<Vec<_>>(),
+        vec!["match_version", "match_program_name_len"]
+    );
+}
