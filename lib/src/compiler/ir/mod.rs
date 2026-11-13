@@ -761,8 +761,8 @@ impl IR {
                     Event::Leave((*expr_id, self.get_mut(*expr_id), *ctx))
                 }
             });
-            if let Event::Enter((expr, _)) = evt {
-                dfs_common(&self.nodes[expr.0 as usize], &mut stack);
+            if let Event::Enter((expr, ctx)) = evt {
+                dfs_common(&self.nodes[expr.0 as usize], ctx, &mut stack);
             }
         }
     }
@@ -1688,10 +1688,13 @@ impl IR {
         };
 
         for (i, byte) in bytes.iter().enumerate() {
+            let Some(byte_offset) = offset.checked_add(i) else {
+                break;
+            };
             self.add_constraint(
                 constrained_bytes,
                 unsatisfiable,
-                offset + i,
+                byte_offset,
                 *byte,
             );
         }
