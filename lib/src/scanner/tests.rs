@@ -705,6 +705,71 @@ fn max_matches_per_pattern() {
     // If the scanner is used again it should produce results because the
     // number of matches must be reset to 0 for the new scan.
     assert_eq!(scanner.scan(b"foo").unwrap().matching_rules().len(), 1);
+
+    // When `max_matches_per_pattern` is reached, a longer greedy match at an
+    // already-recorded start offset must still extend the existing match in
+    // place rather than being rejected.
+    let rules = crate::compile(
+        r#"
+        rule greedy_at_limit {
+            strings:
+              $alt = /abcd|.{2}cdef/
+              $chain = /1234.{0,300}5678/
+            condition:
+              $alt and $chain
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut scanner = Scanner::new(&rules);
+    scanner.max_matches_per_pattern(1);
+
+    let scan_results = scanner
+        .scan(b"abcdef 1234aaaa5678bbbb5678")
+        .expect("scan should not fail");
+
+    let rule = scan_results.matching_rules().next().unwrap();
+    let mut patterns = rule.patterns();
+
+    let alt_matches: Vec<_> =
+        patterns.next().unwrap().matches().map(|m| m.range()).collect();
+    assert_eq!(alt_matches, vec![0..6]);
+
+    let chain_matches: Vec<_> =
+        patterns.next().unwrap().matches().map(|m| m.range()).collect();
+    assert_eq!(chain_matches, vec![7..27]);
+
+    // Also verify in-place extension via binary search when the updated match
+    // is earlier than the last recorded match (`start < last.start`).
+    let rules = crate::compile(
+        r#"
+        rule greedy_bsearch_at_limit {
+            strings:
+              $a = /abcd|1234|.{10}efgh/
+            condition:
+              $a
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut scanner = Scanner::new(&rules);
+    scanner.max_matches_per_pattern(2);
+
+    let scan_results =
+        scanner.scan(b"abcdx1234xefgh").expect("scan should not fail");
+    let matches: Vec<_> = scan_results
+        .matching_rules()
+        .next()
+        .unwrap()
+        .patterns()
+        .next()
+        .unwrap()
+        .matches()
+        .map(|m| m.range())
+        .collect();
+    assert_eq!(matches, vec![0..14, 5..9]);
 }
 
 #[test]
@@ -988,6 +1053,33 @@ fn max_scan_size() {
             .len(),
         0
     );
+
+    // Exercise the >32MB mmap path in `Scanner::load_file` using a sparse
+    // 40MB file with "aaaa" placed at offset 35MB.
+    struct TempFile(std::path::PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let temp = TempFile(
+        std::env::temp_dir()
+            .join(format!("yara_x_max_scan_size_{}.bin", std::process::id())),
+    );
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::File::create(&temp.0).unwrap();
+        f.set_len(40_000_000).unwrap();
+        f.seek(SeekFrom::Start(35_000_000)).unwrap();
+        f.write_all(b"aaaa").unwrap();
+    }
+
+    let mut scanner = Scanner::new(&rules);
+    assert_eq!(scanner.scan_file(&temp.0).unwrap().matching_rules().len(), 1);
+
+    scanner.max_scan_size(33_000_000);
+    assert_eq!(scanner.scan_file(&temp.0).unwrap().matching_rules().len(), 0);
 }
 
 #[cfg(feature = "test_proto2-module")]
@@ -1742,4 +1834,316 @@ fn hoisting_max_vars_and_candidate_limit() {
     let mut scanner = Scanner::new(&rules);
     assert_eq!(scanner.scan(b"A").unwrap().matching_rules().len(), 1);
     assert_eq!(scanner.scan(b"B").unwrap().matching_rules().len(), 0);
+}
+
+#[test]
+fn non_matching_private_rules() {
+    // Regression test: the number of non-matching private rules was tracked
+    // only for global rules (or with profiling), which made the length of
+    // `non_matching_rules()` wrong and iterating it overflow.
+    let rules = crate::compile(
+        r#"
+        private rule p1 { condition: filesize > 100 }
+        private rule p2 { condition: filesize == 3 }
+        private global rule pg { condition: filesize < 1000 }
+        rule a { condition: filesize > 100 }
+        rule b { condition: true }
+        "#,
+    )
+    .unwrap();
+
+    let mut scanner = Scanner::new(&rules);
+
+    for (data, matching, non_matching) in [
+        (&b"abc"[..], vec!["p2", "pg", "b"], vec!["p1", "a"]),
+        (&[0_u8; 500][..], vec!["p1", "pg", "a", "b"], vec!["p2"]),
+        (&[0_u8; 2000][..], vec![], vec!["p1", "p2", "pg", "a", "b"]),
+    ] {
+        let results = scanner.scan(data).unwrap();
+
+        let m = results.matching_rules().include_private(true);
+        assert_eq!(m.len(), matching.len());
+        assert_eq!(m.map(|r| r.identifier()).collect::<Vec<_>>(), matching);
+
+        let n = results.non_matching_rules().include_private(true);
+        assert_eq!(n.len(), non_matching.len());
+        assert_eq!(
+            n.map(|r| r.identifier()).collect::<Vec<_>>(),
+            non_matching
+        );
+
+        let public: Vec<_> =
+            non_matching.iter().filter(|r| !r.starts_with('p')).collect();
+        let n = results.non_matching_rules();
+        assert_eq!(n.len(), public.len());
+        assert_eq!(n.count(), public.len());
+    }
+}
+
+#[cfg(feature = "pe-module")]
+#[test]
+fn hoisting_nested_field_access_after_lookup() {
+    let mut compiler = crate::Compiler::new();
+    compiler
+        .condition_optimization(true)
+        .add_source(
+            r#"
+            import "pe"
+            rule match_version {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.chain[0].version == 1
+                )
+            }
+            rule mismatch_version {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.chain[0].version == 2
+                )
+            }
+            rule match_program_name_len {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.program_name.len() == 1
+                )
+            }
+            rule mismatch_program_name_len {
+              condition:
+                for any i in (0..pe.number_of_signatures) : (
+                  pe.signatures[i].signer_info.program_name.len() == 2
+                )
+            }
+            "#,
+        )
+        .unwrap();
+
+    let rules = compiler.build();
+
+    let mut cert = mods::pe::Certificate::new();
+    cert.set_version(1);
+
+    let mut signer_info = mods::pe::SignerInfo::new();
+    signer_info.set_program_name("a".to_string());
+    signer_info.chain.push(cert);
+
+    let mut sig = mods::pe::Signature::new();
+    sig.signer_info = protobuf::MessageField::some(signer_info);
+
+    let mut pe = Box::new(mods::PE::new());
+    pe.set_is_pe(true);
+    pe.set_number_of_signatures(1);
+    pe.signatures.push(sig);
+
+    let mut scanner = Scanner::new(&rules);
+    scanner.set_module_output(pe).unwrap();
+    let results = scanner.scan(b"").unwrap();
+
+    assert_eq!(
+        results.matching_rules().map(|r| r.identifier()).collect::<Vec<_>>(),
+        vec!["match_version", "match_program_name_len"]
+    );
+}
+
+#[test]
+fn chained_patterns_distance_precheck() {
+    // 1. Motivating rule with optional prefix in head and prefix class atoms
+    // in tail (`bck_code == None`).
+    let rules = crate::compile(
+        r#"
+        rule redleaves_cfg {
+            strings:
+                $format_v2 = /\.?AV[\x00-\xFF]{1,500}[0-9a-z\.]{10}[0-9a-zA-Z\.\x00]{44}[\x00]{10}[0-9a-z\.]{10}[0-9a-zA-Z\.\x00]{44}[\x00]{10}[0-9a-z\.]{10}[0-9a-zA-Z\.\x00]{44}[\x00]{10}(\xBB\x01|\x50)/
+            condition:
+                $format_v2
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut tail = Vec::new();
+    for _ in 0..3 {
+        tail.extend_from_slice(b"host.local"); // 10 bytes in [0-9a-z.]
+        tail.extend_from_slice(&[b'A'; 44]);
+        tail.extend_from_slice(&[0x00; 10]);
+    }
+    tail.extend_from_slice(b"\xBB\x01");
+
+    let mut scanner = Scanner::new(&rules);
+
+    // Tail without `.AV` / `AV` head never matches even when repeated many times.
+    let mut no_head = Vec::new();
+    for _ in 0..20 {
+        no_head.extend_from_slice(&tail);
+    }
+    assert_eq!(scanner.scan(&no_head).unwrap().matching_rules().len(), 0);
+
+    // Gap 0 fails (`{1,500}`), gap 1 and gap 500 succeed, gap 501 fails.
+    for (gap_len, expected) in [(0, 0), (1, 1), (500, 1), (501, 0)] {
+        let mut buf = b".AV".to_vec();
+        buf.extend(std::iter::repeat_n(0xFF, gap_len));
+        buf.extend_from_slice(&tail);
+        assert_eq!(
+            scanner.scan(&buf).unwrap().matching_rules().len(),
+            expected,
+            "gap_len = {gap_len}"
+        );
+    }
+
+    // 2. Interior tail atoms (`bck_code == Some(_)` in both FastVM and PikeVM,
+    // plus `wide` mode), where `atom_pos - head.end` exceeds `gap_max` (500)
+    // while `tail_match.start - head.end` is within `gap_max` thanks to
+    // backward matching.
+    let bck_rules = crate::compile(
+        r#"
+        rule fast_vm_bck {
+            strings:
+                $a = /HEAD[\x00-\xFF]{1,500}[a-z]{10}TAIL/
+            condition:
+                $a
+        }
+        rule pike_vm_bck {
+            strings:
+                $a = /HEAD[\x00-\xFF]{1,500}(ab|cd){5}TAIL/
+            condition:
+                $a
+        }
+        rule pike_vm_bck_wide {
+            strings:
+                $a = /HEAD.{1,300}(ab|cd){5}TAIL/s wide
+            condition:
+                $a
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut bck_scanner = Scanner::new(&bck_rules);
+
+    // `HEAD` (0..4), 500 gap bytes (4..504), 10-byte prefix (504..514), `TAIL`
+    // at 514..518 (`atom_pos - head.end == 510 > 500`, `tail.start - head.end == 500`).
+    let mut exact_max = b"HEAD".to_vec();
+    exact_max.extend(std::iter::repeat_n(b'_', 500));
+    exact_max.extend_from_slice(b"abababababTAIL");
+    let matching: Vec<_> = bck_scanner
+        .scan(&exact_max)
+        .unwrap()
+        .matching_rules()
+        .map(|r| r.identifier())
+        .collect();
+    assert_eq!(matching, vec!["fast_vm_bck", "pike_vm_bck"]);
+
+    // Adding 1 byte to the gap (`tail.start - head.end == 501`) must not match.
+    let mut over_max = b"HEAD".to_vec();
+    over_max.extend(std::iter::repeat_n(b'_', 501));
+    over_max.extend_from_slice(b"abababababTAIL");
+    assert_eq!(bck_scanner.scan(&over_max).unwrap().matching_rules().len(), 0);
+
+    // Wide mode with interior atom (`TAIL` wide): `ChainedPatternGap` measures
+    // raw byte distance (`1..=300`), so 150 wide `_` characters (300 bytes)
+    // between wide `HEAD` and wide `(ab|cd){5}TAIL` puts `atom_pos - head.end`
+    // at 320 (> 300) while `tail.start - head.end` is 300.
+    let to_wide =
+        |s: &[u8]| -> Vec<u8> { s.iter().flat_map(|&b| [b, 0]).collect() };
+    let mut wide_buf = to_wide(b"HEAD");
+    wide_buf.extend_from_slice(&to_wide(&[b'_'; 150]));
+    wide_buf.extend_from_slice(&to_wide(b"abababababTAIL"));
+    let matching_wide: Vec<_> = bck_scanner
+        .scan(&wide_buf)
+        .unwrap()
+        .matching_rules()
+        .map(|r| r.identifier())
+        .collect();
+    assert_eq!(matching_wide, vec!["pike_vm_bck_wide"]);
+
+    // 3. Non-monotonic head `range.end`, multi-piece regexp chain, literal
+    // chain tail with >4-byte literal (inexact atom), and block scanning.
+    let chain_rules = crate::compile(
+        r#"
+        rule non_monotonic_and_multilink {
+            strings:
+                $nm = /(AA[a-z]{40}BB|cc)[\x00-\xFF]{5,10}[0-9]{2}TAIL/
+                $ml = /H1H1[\x00-\xFF]{1,300}M1M1[\x00-\xFF]{1,300}[0-9]{2}T1T1/
+                $lit = /LHEAD[\x00-\xFF]{1,300}LTAIL_LONG/
+            condition:
+                $nm and $ml and $lit
+        }
+        "#,
+    )
+    .unwrap();
+
+    // `AA` at 0 matches `0..44` (`end = 44`), while `cc` inside it at `2..4`
+    // pushes a shorter `end = 4` afterwards; `99TAIL` at `49` has gap `5` from `44`.
+    let mut data = b"AAcc".to_vec();
+    data.extend(std::iter::repeat_n(b'z', 38));
+    data.extend_from_slice(b"BB");
+    data.extend_from_slice(b"1234599TAIL");
+    data.extend_from_slice(b"H1H1_____M1M1_____99T1T1");
+    data.extend_from_slice(b"LHEAD_____LTAIL_LONG");
+
+    let mut scanner = Scanner::new(&chain_rules);
+    assert_eq!(scanner.scan(&data).unwrap().matching_rules().len(), 1);
+
+    // Block scanning at a non-zero `base` offset (`base = 1_000_000`) clears
+    // unconfirmed matches across blocks and rebases offsets accurately.
+    let mut block_scanner = crate::blocks::Scanner::new(&chain_rules);
+    block_scanner.scan(0, b"LTAIL_LONG 99T1T1 99TAIL without heads").unwrap();
+    block_scanner.scan(1_000_000, &data).unwrap();
+    let block_results = block_scanner.finish().unwrap();
+    assert_eq!(block_results.matching_rules().len(), 1);
+}
+
+#[test]
+fn console_log_borrowed_bufwriter() {
+    use std::io::{BufWriter, Write};
+
+    fn assert_unpin<T: Unpin>() {}
+    fn assert_covariant<'a>(s: Scanner<'static>) -> Scanner<'a> {
+        s
+    }
+    fn assert_blocks_covariant<'a>(
+        s: crate::blocks::Scanner<'static>,
+    ) -> crate::blocks::Scanner<'a> {
+        s
+    }
+
+    assert_unpin::<Scanner<'_>>();
+    assert_unpin::<crate::blocks::Scanner<'_>>();
+    let _ = (assert_covariant, assert_blocks_covariant);
+
+    let rules = crate::compile(
+        r#"
+        import "console"
+        rule test {
+            condition:
+                console.log("hello from the rule")
+        }
+        "#,
+    )
+    .unwrap();
+
+    // Valid drop order: `log` is declared before `scanner`, so `scanner`
+    // (and the `BufWriter` inside its `console_log` callback) drops and
+    // flushes into `log` before `log` is read or dropped.
+    let mut log = b"console output:\n".to_vec();
+    {
+        let mut scanner = Scanner::new(&rules);
+        let mut writer = BufWriter::new(&mut log);
+        scanner.console_log(move |msg| {
+            writeln!(writer, "{msg}").unwrap();
+        });
+        scanner.scan(b"some data").unwrap();
+    }
+    assert_eq!(log, b"console output:\nhello from the rule\n");
+
+    let mut block_log = b"console output:\n".to_vec();
+    {
+        let mut scanner = crate::blocks::Scanner::new(&rules);
+        let mut writer = BufWriter::new(&mut block_log);
+        scanner.console_log(move |msg| {
+            writeln!(writer, "{msg}").unwrap();
+        });
+        scanner.scan(0, b"some data").unwrap();
+        scanner.finish().unwrap();
+    }
+    assert_eq!(block_log, b"console output:\nhello from the rule\n");
 }

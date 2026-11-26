@@ -15,7 +15,7 @@ use der_parser::nom::Parser;
 use der_parser::nom::branch::alt;
 use der_parser::nom::combinator::{consumed, map_res};
 use der_parser::num_bigint::BigUint;
-use der_parser::{Oid, asn1_rs, parse_ber};
+use der_parser::{Oid, asn1_rs};
 
 use digest::Digest;
 use sha1::Sha1;
@@ -209,8 +209,14 @@ impl<'a> SignedData<'a> {
             })
             .map_err(|_| BerValueError)?;
 
+        // The CRLs are not used, so the content of the field is skipped
+        // without being parsed. `RevocationInfoChoices` is a `SET OF` that
+        // can be empty or contain multiple items, so it must not be parsed
+        // as a single BER element.
         let (remainder, _revocation_info) = OptTaggedParser::from(1)
-            .parse_ber(remainder, |_, data| parse_ber(data))?;
+            .parse_ber(remainder, |_, _| -> BerResult<'_, ()> {
+                Ok((&[], ()))
+            })?;
 
         let (remainder, signer_infos) =
             parse_ber_set_of_v(SignerInfo::parse)(remainder)?;
@@ -227,6 +233,10 @@ impl<'a> SignedData<'a> {
         ))
     }
 
+    /// Maximum number of X.509 certificates parsed from a single `SignedData`
+    /// structure.
+    const MAX_CERTIFICATES: usize = 256;
+
     pub fn parse_certificates(input: &[u8]) -> (&[u8], Vec<Certificate<'_>>) {
         let mut remainder = input;
         let mut certificates = Vec::new();
@@ -236,20 +246,22 @@ impl<'a> SignedData<'a> {
         let mut cert_parser =
             consumed(|input| X509CertificateParser::new().parse(input));
 
-        loop {
+        while certificates.len() < Self::MAX_CERTIFICATES {
             remainder = match cert_parser(remainder) {
-                Ok((remainder, (cert_bytes, cert))) => {
+                Ok((next, (cert_bytes, cert))) if !cert_bytes.is_empty() => {
                     certificates.push(Certificate {
                         x509: cert,
                         thumbprint: hex::encode(Sha1::digest(cert_bytes)),
                     });
-                    remainder
+                    next
                 }
-                Err(_) => {
+                _ => {
                     return (remainder, certificates);
                 }
             }
         }
+
+        (remainder, certificates)
     }
 }
 
@@ -472,7 +484,7 @@ pub struct SpcIndirectDataContent<'a> {
 
 impl<'a> SpcIndirectDataContent<'a> {
     pub fn parse_inner(input: &'a [u8]) -> BerResult<'a, Self> {
-        let (remainder, _data) = parse_ber(input)?;
+        let (remainder, _data) = parse_ber_any(input)?;
         let (remainder, message_digest) = DigestInfo::parse(remainder)?;
 
         Ok((remainder, Self { message_digest }))
@@ -635,7 +647,7 @@ impl<'a> TstInfo<'a> {
     pub fn parse(input: &'a [u8]) -> BerResult<'a, Self> {
         parse_ber_sequence_defined_g(|input: &[u8], _| {
             let (remainder, _version) = parse_ber_integer(input)?;
-            let (remainder, _policy) = parse_ber(remainder)?;
+            let (remainder, _policy) = parse_ber_any(remainder)?;
 
             let (remainder, (hash_algorithm, hashed_message)) =
                 Self::parse_message_imprint(remainder)?;
@@ -654,7 +666,8 @@ impl<'a> TstInfo<'a> {
                 AlgorithmIdentifier::from_ber(input)
                     .map_err(|_| BerValueError)?;
 
-            let (remainder, hashed_message) = parse_ber(remainder)?;
+            let (remainder, hashed_message) =
+                parse_ber_octetstring(remainder)?;
 
             Ok((remainder, (hash_algorithm, hashed_message.as_slice()?)))
         })(input)
@@ -683,4 +696,39 @@ fn string_from_utf16be(v: &[u8]) -> Option<String> {
         char::decode_utf16(codepoints).collect::<Result<_, _>>().ok()?;
 
     Some(x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_data_crls() {
+        // Minimal `SignedData` fields preceding `crls`: version (1),
+        // empty digestAlgorithms, and encapContentInfo (data OID + empty
+        // octet string).
+        let head = [
+            0x02, 0x01, 0x01, 0x31, 0x00, 0x30, 0x0f, 0x06, 0x09, 0x2a, 0x86,
+            0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01, 0xa0, 0x02, 0x04, 0x00,
+        ];
+        // Empty `signerInfos`.
+        let tail = [0x31, 0x00];
+
+        // `crls` is an optional `SET OF` that may be absent, empty, or have
+        // one or more items.
+        let crls_cases: [&[u8]; 4] = [
+            &[],
+            &[0xa1, 0x00],
+            &[0xa1, 0x02, 0x30, 0x00],
+            &[0xa1, 0x04, 0x30, 0x00, 0x30, 0x00],
+        ];
+
+        for crls in crls_cases {
+            let data = [&head[..], crls, &tail[..]].concat();
+            let (remainder, signed_data) =
+                SignedData::parse_inner(&data).unwrap();
+            assert!(remainder.is_empty());
+            assert_eq!(signed_data.version, 1);
+        }
+    }
 }

@@ -23,7 +23,7 @@ use crate::commands::{
     meta_file_value_parser, path_with_namespace_parser,
     truncate_with_ellipsis,
 };
-use crate::walk::Draw;
+use crate::console::Draw;
 use crate::walk::Message;
 use crate::{help, walk};
 
@@ -65,6 +65,11 @@ pub fn scan() -> Command {
                 .value_parser(value_parser!(u8).range(1..=99)),
             arg!(--"disable-console-logs")
                 .help("Disable printing console log messages"),
+            arg!(--"exclude" <PATH>)
+                .help("Exclude a file or directory from scanning")
+                .long_help(help::SCAN_EXCLUDE_LONG_HELP)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Append),
             arg!(-f --"fast-scan")
                 .help("Enable fast-scan mode")
                 .long_help(help::FAST_SCAN_LONG_HELP),
@@ -211,7 +216,20 @@ pub fn exec_scan(args: &ArgMatches, config: &Config) -> anyhow::Result<()> {
         );
     }
 
-    if recursive.is_some() && target_path.is_file() {
+    // Validate exclusions before compiling rules, and avoid inspecting the
+    // target at all when it is excluded.
+    let mut exclusions = walk::Exclusions::default();
+
+    if let Some(excluded_paths) = args.get_many::<PathBuf>("exclude") {
+        exclusions = walk::Exclusions::new();
+        for path in excluded_paths {
+            exclusions.add(path)?;
+        }
+    }
+
+    let target_excluded = !scan_list && exclusions.contains(target_path);
+
+    if recursive.is_some() && !target_excluded && target_path.is_file() {
         bail!(
             "can't use '{}' when <TARGET_PATH> is a file",
             Paint::bold("--recursive")
@@ -262,6 +280,8 @@ pub fn exec_scan(args: &ArgMatches, config: &Config) -> anyhow::Result<()> {
     } else {
         walk::ParWalker::path(target_path)
     };
+
+    w.exclusions(exclusions);
 
     if let Some(num_threads) = num_threads {
         w.num_threads(*num_threads);
@@ -558,10 +578,11 @@ impl Draw for ScanState {
         output.push('\n');
 
         output.push_str(&"╶".repeat(width));
-        output.push('\n');
 
         for (file, start_time) in self.files_in_progress.lock().unwrap().iter()
         {
+            output.push('\n');
+
             let max_path_with = width.saturating_sub(7);
 
             let (path, path_width) = truncate_with_ellipsis(
@@ -578,7 +599,6 @@ impl Draw for ScanState {
                 Instant::elapsed(start_time).as_secs_f32()
             );
             output.push_str(&line);
-            output.push('\n');
         }
 
         output
@@ -924,7 +944,10 @@ mod output_handler {
             scan_results: &mut dyn Iterator<Item = Rule>,
             output: &Sender<Message>,
         ) -> bool {
-            let path = file_path.to_str().unwrap();
+            // Paths are not guaranteed to be valid UTF-8, use a lossy
+            // conversion instead of panicking when they are not.
+            let path = file_path.to_string_lossy();
+            let path = path.as_ref();
 
             if self.output_options.count_only {
                 let count = scan_results.count();
@@ -982,6 +1005,8 @@ mod output_handler {
     struct MatchJson {
         rule: String,
         file: String,
+        #[serde(skip)]
+        raw_path: PathBuf,
         #[serde(skip_serializing_if = "Option::is_none")]
         meta: Option<HashMap<String, serde_json::Value>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1071,12 +1096,11 @@ mod output_handler {
                 return false;
             }
 
-            let path = dunce::canonicalize(file_path)
-                .ok()
-                .as_ref()
-                .and_then(|absolute| absolute.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            // Fall back to the scanned path if canonicalize fails, and convert
+            // lossily so non-UTF-8 paths are reported instead of becoming "".
+            let canonical_path = dunce::canonicalize(file_path)
+                .unwrap_or_else(|_| file_path.to_path_buf());
+            let path = canonical_path.to_string_lossy().into_owned();
 
             // prepare the increment *outside* the critical section
             let matching_rules = matching_rules.map(|rule| {
@@ -1127,6 +1151,7 @@ mod output_handler {
                     rule: rule.identifier().to_string(),
                     meta,
                     file,
+                    raw_path: canonical_path.clone(),
                     tags,
                     strings,
                 }
@@ -1149,14 +1174,23 @@ mod output_handler {
 
             let rendered_json = match self.output_options.count_only {
                 true => {
+                    // Group by the original raw path so distinct non-UTF-8
+                    // file names whose lossy UTF-8 strings collide are not
+                    // merged into a single entry.
                     let json_output = matches
                         .iter()
                         .fold(HashMap::new(), |mut acc, it| {
-                            *acc.entry(&it.file).or_insert(0) += 1;
+                            let entry = acc
+                                .entry(&it.raw_path)
+                                .or_insert((&it.file, 0));
+                            entry.1 += 1;
                             acc
                         })
                         .into_iter()
-                        .map(|(path, count)| JsonCountOutput { path, count })
+                        .map(|(_, (path, count))| JsonCountOutput {
+                            path,
+                            count,
+                        })
                         .collect::<Vec<_>>();
 
                     serde_json::to_string_pretty(&json_output)

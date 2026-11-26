@@ -177,13 +177,13 @@ pub fn error_enum_macro_derive(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// The macro can also receive a `public` argument, which specifies that the
-/// function will be visible from YARA rules.
+/// The macro can also receive a `builtin` argument, which specifies that the
+/// function is a global built-in visible from all YARA rules.
 ///
 /// # Example
 ///
 /// ```text
-/// #[wasm_export(public = true)]
+/// #[wasm_export(builtin = true)]
 /// fn uint8(caller: Caller<'_, ScanContext>, offset: i64) -> i64 {
 ///   ...
 /// }
@@ -258,6 +258,15 @@ pub fn wasm_export(args: TokenStream, input: TokenStream) -> TokenStream {
 /// #[module_export(my_struct.add)]
 ///  fn add(ctx: &ScanContext, a: i64, b: i64) -> i64 {
 ///   a + b
+/// }
+/// ```
+///
+/// Exporting a function with an alternate name using `alias`:
+///
+/// ```text
+/// #[module_export(name = "contains_method", alias = "has_method")]
+/// fn contains_method(ctx: &ScanContext, value: RuntimeString) -> Option<bool> {
+///     ...
 /// }
 /// ```
 #[proc_macro_attribute]

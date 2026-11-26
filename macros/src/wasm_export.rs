@@ -83,7 +83,7 @@ impl<'ast> FuncSignatureParser<'ast> {
             "bool" => Ok(Cow::Borrowed("b")),
 
             "PatternId" | "RuleId" => Ok(Cow::Borrowed("i64")),
-            "RegexId" => Ok(Cow::Borrowed("r")),
+            "RegExpId" => Ok(Cow::Borrowed("r")),
             "Rc" => Ok(Cow::Borrowed("i64")),
             "RuntimeObjectHandle" => Ok(Cow::Borrowed("i64")),
             "RuntimeString" => Ok(Cow::Borrowed("s")),
@@ -239,10 +239,36 @@ impl<'ast> Visit<'ast> for FuncSignatureParser<'ast> {
 /// Arguments received by the `#[wasm_export]` macro.
 pub struct WasmExportArgs {
     name: Option<String>,
+    alias: Option<String>,
     method_of: Option<String>,
     sync: Option<String>,
     #[darling(default)]
-    public: bool,
+    builtin: bool,
+    #[darling(default)]
+    module: bool,
+}
+
+pub(crate) fn validate_alias(
+    fn_name: &str,
+    alias: Option<&str>,
+) -> Result<()> {
+    if let Some(alias) = alias {
+        if alias.is_empty() {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                "alias cannot be empty",
+            ));
+        }
+        if alias == fn_name {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "alias `{alias}` cannot be the same as the function name"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn sync_flags_literal(
@@ -291,10 +317,10 @@ fn sync_flags_literal(
 /// inventory::submit! {
 ///     WasmExport {
 ///         name: "add",
+///         alias: None,
 ///         mangled_name: "add@ii@i",
-///         public: false,
+///         kind: WasmExportKind::Internal,
 ///         rust_module_path: "yara_x::modules::my_module",
-///         method_of: None,
 ///         sync_flags: 3,
 ///         func: &WasmExportedFn2 { target_fn: &add },
 ///         description: Some(Cow::Borrowed("This function adds two numbers.")),
@@ -353,37 +379,73 @@ pub(crate) fn impl_wasm_export_macro(
     // Rust, but the YARA name can be changed with the `name` argument, as
     // in: #[wasm_export(name = "some_other_name")].
     let fn_name = attr_args.name.unwrap_or(rust_fn_name.to_string());
+    let alias = attr_args.alias.as_deref();
+
+    validate_alias(&fn_name, alias)?;
 
     // The real number of argument is one less than in the Rust function's
     // signature. The first argument &mut Caller<'_, ScanContext> doesn't
     // count.
     let num_args = func.sig.inputs.len() - 1;
 
-    let public = attr_args.public;
+    let num_kinds = u8::from(attr_args.builtin)
+        + u8::from(attr_args.module)
+        + u8::from(attr_args.method_of.is_some());
+
+    if num_kinds > 1 {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "`builtin`, `module`, and `method_of` are mutually exclusive",
+        ));
+    }
+
+    if alias.is_some() && num_kinds == 0 {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "`alias` can only be used with `builtin`, `module`, or `method_of`",
+        ));
+    }
+
+    let alias_tokens = match alias {
+        Some(alias) => quote! { Some(#alias) },
+        None => quote! { None },
+    };
+
     let export_ident = format_ident!("export__{}", rust_fn_name);
     let exported_fn_ident = format_ident!("WasmExportedFn{}", num_args);
     let args_signature = FuncSignatureParser::new().parse(&func)?;
     let sync_flags = sync_flags_literal(attr_args.sync.as_deref(), "both")?;
 
-    let method_of = attr_args
-        .method_of
-        .as_ref()
-        .map_or_else(|| quote! { None}, |m| quote! { Some(#m) });
-
-    let mangled_fn_name = if let Some(ty_name) = attr_args.method_of {
-        format!("{ty_name}::{fn_name}{args_signature}")
+    let (kind, mangled_fn_name) = if let Some(ty_name) = attr_args.method_of {
+        (
+            quote! { WasmExportKind::Method(#ty_name) },
+            format!("{ty_name}::{fn_name}{args_signature}"),
+        )
+    } else if attr_args.builtin {
+        (
+            quote! { WasmExportKind::Builtin },
+            format!("{fn_name}{args_signature}"),
+        )
+    } else if attr_args.module {
+        (
+            quote! { WasmExportKind::Module },
+            format!("{fn_name}{args_signature}"),
+        )
     } else {
-        format!("{fn_name}{args_signature}")
+        (
+            quote! { WasmExportKind::Internal },
+            format!("{fn_name}{args_signature}"),
+        )
     };
 
     let fn_descriptor = quote! {
         #[allow(non_upper_case_globals)]
         pub(crate) static #export_ident: WasmExport = WasmExport {
             name: #fn_name,
+            alias: #alias_tokens,
             mangled_name: #mangled_fn_name,
-            public: #public,
+            kind: #kind,
             rust_module_path: module_path!(),
-            method_of: #method_of,
             sync_flags: #sync_flags,
             func: &#exported_fn_ident { target_fn: &#rust_fn_name },
             description: #description,
@@ -392,10 +454,10 @@ pub(crate) fn impl_wasm_export_macro(
         inventory::submit! {
             WasmExport {
                 name: #fn_name,
+                alias: #alias_tokens,
                 mangled_name: #mangled_fn_name,
-                public: #public,
+                kind: #kind,
                 rust_module_path: module_path!(),
-                method_of: #method_of,
                 sync_flags: #sync_flags,
                 func: &#exported_fn_ident { target_fn: &#rust_fn_name },
                 description: #description,
@@ -513,5 +575,169 @@ mod tests {
         };
 
         assert_eq!(parser.parse(&func).unwrap(), "@@s:N32:Lu");
+    }
+
+    #[test]
+    fn wasm_export_kind_variants_and_exclusivity() {
+        use crate::wasm_export::impl_wasm_export_macro;
+        use darling::ast::NestedMeta;
+        use quote::quote;
+
+        let parse_args = |tokens: proc_macro2::TokenStream| {
+            NestedMeta::parse_meta_list(tokens).unwrap()
+        };
+
+        let func: syn::ItemFn = parse_quote! {
+            fn foo(caller: &mut Caller<'_, ScanContext>) -> i64 { 0 }
+        };
+
+        let internal =
+            impl_wasm_export_macro(parse_args(quote! {}), func.clone())
+                .unwrap()
+                .to_string();
+        assert!(internal.contains("WasmExportKind :: Internal"));
+
+        let builtin = impl_wasm_export_macro(
+            parse_args(quote! { builtin = true }),
+            func.clone(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(builtin.contains("WasmExportKind :: Builtin"));
+
+        let module = impl_wasm_export_macro(
+            parse_args(quote! { module = true }),
+            func.clone(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(module.contains("WasmExportKind :: Module"));
+
+        let method = impl_wasm_export_macro(
+            parse_args(quote! { method_of = "MyType" }),
+            func.clone(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(method.contains("WasmExportKind :: Method (\"MyType\")"));
+
+        for conflicting in [
+            quote! { builtin = true, module = true },
+            quote! { builtin = true, method_of = "MyType" },
+            quote! { module = true, method_of = "MyType" },
+        ] {
+            let err =
+                impl_wasm_export_macro(parse_args(conflicting), func.clone())
+                    .unwrap_err();
+            assert!(err.to_string().contains("mutually exclusive"));
+        }
+    }
+
+    #[test]
+    fn wasm_export_alias() {
+        use crate::wasm_export::impl_wasm_export_macro;
+        use darling::ast::NestedMeta;
+        use quote::quote;
+
+        let parse_args = |tokens: proc_macro2::TokenStream| {
+            NestedMeta::parse_meta_list(tokens).unwrap()
+        };
+
+        let func: syn::ItemFn = parse_quote! {
+            fn contains_method(caller: &mut Caller<'_, ScanContext>) -> i64 { 0 }
+        };
+
+        let no_alias = impl_wasm_export_macro(
+            parse_args(quote! { module = true }),
+            func.clone(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(no_alias.contains("alias : None"));
+
+        let single_alias = impl_wasm_export_macro(
+            parse_args(quote! {
+                name = "contains_method",
+                alias = "has_method",
+                module = true
+            }),
+            func.clone(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(single_alias.contains("name : \"contains_method\""));
+        assert!(single_alias.contains("alias : Some (\"has_method\")"));
+        assert!(
+            single_alias.contains("mangled_name : \"contains_method@@i64\"")
+        );
+
+        let method_alias = impl_wasm_export_macro(
+            parse_args(quote! {
+                name = "contains_method",
+                alias = "has_method",
+                method_of = "dex.Dex"
+            }),
+            func.clone(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(method_alias.contains("alias : Some (\"has_method\")"));
+        assert!(
+            method_alias
+                .contains("mangled_name : \"dex.Dex::contains_method@@i64\"")
+        );
+
+        let builtin_alias = impl_wasm_export_macro(
+            parse_args(quote! { alias = "has_method", builtin = true }),
+            func.clone(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(builtin_alias.contains("alias : Some (\"has_method\")"));
+
+        // `alias` is not allowed on internal exports.
+        let err = impl_wasm_export_macro(
+            parse_args(quote! { alias = "has_method" }),
+            func.clone(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("`alias` can only be used"));
+
+        // Empty alias is rejected.
+        let err = impl_wasm_export_macro(
+            parse_args(quote! { module = true, alias = "" }),
+            func.clone(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("alias cannot be empty"));
+
+        // Alias matching explicit or default function name is rejected.
+        for same_as_name in [
+            quote! {
+                module = true,
+                name = "contains_method",
+                alias = "contains_method"
+            },
+            quote! { module = true, alias = "contains_method" },
+        ] {
+            let err =
+                impl_wasm_export_macro(parse_args(same_as_name), func.clone())
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("cannot be the same as the function")
+            );
+        }
+
+        // Specifying `alias` more than once is rejected.
+        let err = impl_wasm_export_macro(
+            parse_args(quote! {
+                module = true,
+                alias = "has_method",
+                alias = "other_method"
+            }),
+            func,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Duplicate field `alias`"));
     }
 }

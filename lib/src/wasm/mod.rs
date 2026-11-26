@@ -89,7 +89,7 @@ use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
 use yara_x_macros::wasm_export;
 
-use crate::compiler::{LiteralId, PatternId, RegexId, RuleId};
+use crate::compiler::{LiteralId, PatternId, RegExpId, RuleId};
 use crate::scanner::{RuntimeObjectHandle, ScanContext};
 use crate::types::{
     Array, Func, FuncSignature, Map, Struct, TypeValue, Value,
@@ -130,8 +130,31 @@ inventory::collect!(WasmExport);
 
 /// Returns an iterator of [`WasmExport`] structs that describes the functions
 /// that are callable from WASM code.
+///
+/// Module exports (`WasmExportKind::Module`) that do not belong to any
+/// registered YARA module are excluded so orphaned `#[module_export]`
+/// functions cannot collide with built-in or internal WASM imports.
 pub(crate) fn wasm_exports() -> impl Iterator<Item = &'static WasmExport> {
-    inventory::iter::<WasmExport>()
+    inventory::iter::<WasmExport>().filter(|export| {
+        export.kind != WasmExportKind::Module
+            || export.owner_module().is_some()
+    })
+}
+
+/// Describes the kind and visibility scope of a [`WasmExport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasmExportKind {
+    /// Internal runtime helper callable only from compiler-emitted WASM code,
+    /// never visible to YARA rules.
+    Internal,
+    /// Global built-in YARA function visible in all rules without importing a
+    /// module (e.g: `uint8`, `uint16`, `float32`).
+    Builtin,
+    /// Top-level function exported by a YARA module via `#[module_export]`.
+    Module,
+    /// Method of some YARA type or protobuf structure, holding the target
+    /// type's name (e.g: `"RuntimeString"`, `"my_module.MyStruct"`).
+    Method(&'static str),
 }
 
 /// Describes a function that is exported to WASM code.
@@ -139,21 +162,17 @@ pub(crate) fn wasm_exports() -> impl Iterator<Item = &'static WasmExport> {
 pub struct WasmExport {
     /// Function's name.
     pub name: &'static str,
+    /// Optional alternate name (alias) for the function.
+    pub alias: Option<&'static str>,
     /// Function's mangled name. The mangled name contains information about
     /// the function's arguments and return type. For additional details see
     /// [`crate::types::MangledFnName`].
     pub mangled_name: &'static str,
-    /// True if the function is visible from YARA rules. Functions exported by
-    /// modules, as well as built-in functions like uint8, uint16, etc, are
-    /// public, but many other functions callable from WASM are for internal
-    /// use only and therefore are not public.
-    pub public: bool,
+    /// Kind and visibility scope of the exported function.
+    pub kind: WasmExportKind,
     /// Path of the module where the function resides. This an absolute path
     /// that includes the crate name (e.g: yara_x::modules::test_proto2)
     pub rust_module_path: &'static str,
-    /// If the function is a method of some type, this contains the name of
-    /// the type (i.e: `my_module.my_struct`).
-    pub method_of: Option<&'static str>,
     /// Controls whether imported module state must be synchronized before
     /// and/or after invoking the callback from generated WASM code.
     pub sync_flags: u32,
@@ -164,36 +183,53 @@ pub struct WasmExport {
 }
 
 impl WasmExport {
+    /// Returns an iterator over the names under which this function is
+    /// exposed, starting with [`Self::name`] followed by [`Self::alias`] if
+    /// present.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.name).chain(self.alias)
+    }
+
     /// Returns the fully qualified name for a #[wasm_export] function.
     ///
     /// The fully qualified name includes not only the function's name, but
     /// also the module's name (e.g: `my_module.my_struct.my_func@ii@i`)
     pub(crate) fn fully_qualified_mangled_name(&self) -> String {
-        if self.method_of.is_some() {
-            return self.mangled_name.to_string();
-        }
-        for module in crate::modules::registered_modules() {
-            if let Some(rust_module_name) = module.rust_module_name()
-                && self.rust_module_path.contains(rust_module_name)
-            {
-                return format!("{}.{}", module.name(), self.mangled_name);
-            }
+        if let Some(module) = self.owner_module() {
+            return format!("{}.{}", module.name(), self.mangled_name);
         }
         self.mangled_name.to_owned()
     }
 
-    /// Returns true if this export comes from YARA itself, not for a YARA
-    /// module.
+    /// Returns the registered YARA module that this export belongs to, if
+    /// any.
+    ///
+    /// Only [`WasmExportKind::Module`] exports belong to a module, and only if
+    /// defined in the module's `rust_module_name`, which is the Rust module
+    /// where `register_module!` was invoked.
+    pub(crate) fn owner_module(
+        &self,
+    ) -> Option<&'static dyn crate::modules::RegisteredModule> {
+        if self.kind != WasmExportKind::Module {
+            return None;
+        }
+        crate::modules::registered_modules().find(|module| {
+            module.rust_module_name() == Some(self.rust_module_path)
+        })
+    }
+
+    /// Returns true if this export comes from YARA itself as a global
+    /// built-in function, not from a YARA module, method, or internal helper.
     pub fn builtin(&self) -> bool {
-        self.rust_module_path.strip_prefix("yara_x::modules::").is_none()
+        self.kind == WasmExportKind::Builtin
     }
 
     /// Returns a hash map with all function exported to WASM that match the
     /// given predicate.
     ///
-    /// Keys are function names and values are [`Func`] structures. Overloaded
-    /// functions appear in the map as a single entry where the [`Func`] has
-    /// multiple signatures.
+    /// Keys are function names (including any aliases) and values are [`Func`]
+    /// structures. Overloaded functions appear in the map as a single entry
+    /// where the [`Func`] has multiple signatures.
     pub(crate) fn get_functions<P>(
         predicate: P,
     ) -> FxHashMap<&'static str, Func>
@@ -204,30 +240,33 @@ impl WasmExport {
             FxHashMap::default();
 
         // Iterate over the WASM exports looking for those that match the
-        // predicate. Add them to `functions` map, or update the `Func`
-        // object with an additional signature if the function is
-        // overloaded.
+        // predicate. Add them to `functions` map under their primary name and
+        // any aliases, or update the `Func` object with an additional
+        // signature if the function is overloaded.
         for export in wasm_exports().filter(predicate) {
             let mangled_name = export.fully_qualified_mangled_name();
             let description = export.description.clone();
-            // If the function was already present in the map is because it has
-            // multiple signatures. If that's the case, add more signatures to
-            // the existing `Func` object.
-            if let Some(function) = functions.get_mut(export.name) {
-                let mut signature = FuncSignature::from(mangled_name);
-                signature.doc = description;
-                function.add_signature(signature);
-            } else {
-                let mut func = Func::from(mangled_name);
-                // Update the description for the first and only signature in
-                // the function.
-                let signature = func.signatures_mut().get_mut(0).unwrap();
-                // It's safe to get a mutable reference to the signature with
-                // Rc::get_mut because the Rc was just crated and there's a
-                // single reference to it.
-                let signature = Rc::get_mut(signature).unwrap();
-                signature.doc = description;
-                functions.insert(export.name, func);
+            for name in export.names() {
+                // If the function was already present in the map is because it
+                // has multiple signatures. If that's the case, add more
+                // signatures to the existing `Func` object.
+                if let Some(function) = functions.get_mut(name) {
+                    let mut signature =
+                        FuncSignature::from(mangled_name.clone());
+                    signature.doc = description.clone();
+                    function.add_signature(signature);
+                } else {
+                    let mut func = Func::from(mangled_name.clone());
+                    // Update the description for the first and only signature
+                    // in the function.
+                    let signature = func.signatures_mut().get_mut(0).unwrap();
+                    // It's safe to get a mutable reference to the signature
+                    // with Rc::get_mut because the Rc was just created and
+                    // there's a single reference to it.
+                    let signature = Rc::get_mut(signature).unwrap();
+                    signature.doc = description.clone();
+                    functions.insert(name, func);
+                }
             }
         }
 
@@ -249,9 +288,9 @@ impl WasmExport {
     pub(crate) fn get_methods(
         type_name: &str,
     ) -> FxHashMap<&'static str, Func> {
-        WasmExport::get_functions(|export| {
-            export.method_of.is_some_and(|name| name == type_name)
-        })
+        WasmExport::get_functions(
+            |export| matches!(export.kind, WasmExportKind::Method(name) if name == type_name),
+        )
     }
 }
 
@@ -356,10 +395,10 @@ impl WasmArg<LiteralId> for ValRaw {
     }
 }
 
-impl WasmArg<RegexId> for ValRaw {
+impl WasmArg<RegExpId> for ValRaw {
     #[inline]
-    fn raw_into(self, _: &mut ScanContext) -> RegexId {
-        RegexId::from(self.get_i32())
+    fn raw_into(self, _: &mut ScanContext) -> RegExpId {
+        RegExpId::from(self.get_i32())
     }
 }
 
@@ -594,7 +633,7 @@ fn type_id_to_wasmtime(
         return &[ValType::I32];
     } else if type_id == TypeId::of::<RuleId>() {
         return &[ValType::I32];
-    } else if type_id == TypeId::of::<RegexId>() {
+    } else if type_id == TypeId::of::<RegExpId>() {
         return &[ValType::I32];
     } else if type_id == TypeId::of::<()>() {
         return &[];
@@ -969,6 +1008,9 @@ pub(crate) fn is_pat_match_in(
 
 /// Invoked from WASM to ask if at least `required` of the patterns in the
 /// range `pattern_id_start..=pattern_id_end` (inclusive) match.
+///
+/// A `required` of zero means that none of the patterns can match, as in
+/// `0 of them`, which is equivalent to `none of them`.
 #[wasm_export(sync = "none")]
 pub(crate) fn pat_range_match(
     caller: &mut Caller<'_, ScanContext>,
@@ -1011,6 +1053,12 @@ pub(crate) fn pat_range_match(
         if match_found {
             num_matches += 1;
         }
+    }
+
+    // `0 of them` means that no pattern matches, like `none of them`, which
+    // is how the other `of` expressions behave too.
+    if required == 0 {
+        return num_matches == 0;
     }
 
     num_matches >= required
@@ -1669,7 +1717,7 @@ pub(crate) fn str_len(
 pub(crate) fn str_matches(
     caller: &mut Caller<'_, ScanContext>,
     lhs: RuntimeString,
-    rhs: RegexId,
+    rhs: RegExpId,
 ) -> bool {
     let ctx = caller.data();
     ctx.regexp_matches(rhs, lhs.as_bstr(ctx))
@@ -1683,14 +1731,14 @@ pub(crate) fn str_matches_regex_set(
 ) -> bool {
     let ctx = caller.data();
     ctx.regex_set_matches(
-        crate::compiler::RegexSetId::from(regex_set),
+        crate::compiler::RegExpSetId::from(regex_set),
         lhs.as_bstr(ctx),
     )
 }
 
 macro_rules! gen_int_fn {
     ($name:ident, $return_type:ty, $from_fn:ident) => {
-        #[wasm_export(public = true, sync = "none")]
+        #[wasm_export(builtin = true, sync = "none")]
         pub(crate) fn $name(
             caller: &mut Caller<'_, ScanContext>,
             offset: i64,
@@ -1730,7 +1778,7 @@ gen_int_fn!(int64be, i64, from_be_bytes);
 
 macro_rules! gen_float_fn {
     ($name:ident, $return_type:ty, $from_fn:ident) => {
-        #[wasm_export(public = true, sync = "none")]
+        #[wasm_export(builtin = true, sync = "none")]
         pub(crate) fn $name(
             caller: &mut Caller<'_, ScanContext>,
             offset: i64,
@@ -1754,3 +1802,89 @@ gen_float_fn!(float32, f32, from_le_bytes);
 gen_float_fn!(float64, f64, from_le_bytes);
 gen_float_fn!(float32be, f32, from_be_bytes);
 gen_float_fn!(float64be, f64, from_be_bytes);
+
+#[cfg(test)]
+mod tests {
+    use crate::mods::prelude::*;
+
+    // An unowned `#[module_export]` defined inside the `yara_x` crate itself
+    // (outside `yara_x::modules::`) still has `WasmExportKind::Module` and
+    // must never become a global built-in.
+    #[module_export]
+    fn internal_crate_orphan_fn(_ctx: &ScanContext, a: i64) -> i64 {
+        a + 1
+    }
+
+    #[test]
+    fn in_crate_module_export_is_not_builtin() {
+        assert_eq!(
+            export____thunk__internal_crate_orphan_fn.kind,
+            WasmExportKind::Module
+        );
+        assert!(!export____thunk__internal_crate_orphan_fn.builtin());
+
+        let err = crate::compile(
+            r#"rule test { condition: internal_crate_orphan_fn(1) == 2 }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown identifier `internal_crate_orphan_fn`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn export_kinds_match_roles() {
+        assert_eq!(
+            super::export__search_for_patterns.kind,
+            WasmExportKind::Internal
+        );
+        assert!(!super::export__search_for_patterns.builtin());
+
+        assert_eq!(super::export__uint8.kind, WasmExportKind::Builtin);
+        assert!(super::export__uint8.builtin());
+
+        assert_eq!(
+            super::export__string_len.kind,
+            WasmExportKind::Method("RuntimeString")
+        );
+        assert!(!super::export__string_len.builtin());
+    }
+
+    /// Test method with an alias.
+    #[module_export(
+        name = "contains_item",
+        alias = "has_item",
+        method_of = "test_alias.DummyStruct"
+    )]
+    fn dummy_contains_item(_ctx: &ScanContext, _x: i64) -> bool {
+        true
+    }
+
+    #[test]
+    fn method_alias_in_get_methods() {
+        assert_eq!(
+            export____thunk__dummy_contains_item.alias,
+            Some("has_item")
+        );
+        let names: Vec<_> =
+            export____thunk__dummy_contains_item.names().collect();
+        assert_eq!(names, vec!["contains_item", "has_item"]);
+
+        let methods = WasmExport::get_methods("test_alias.DummyStruct");
+        let primary = methods.get("contains_item").unwrap();
+        let alias = methods.get("has_item").unwrap();
+
+        assert_eq!(primary, alias);
+        assert!(alias.is_method());
+        assert_eq!(
+            alias.signatures()[0].mangled_name.as_str(),
+            "test_alias.DummyStruct::contains_item@_x:i64@b"
+        );
+        assert_eq!(
+            alias.signatures()[0].doc.as_deref(),
+            Some(" Test method with an alias.")
+        );
+    }
+}

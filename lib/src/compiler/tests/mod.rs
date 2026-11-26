@@ -27,7 +27,7 @@ fn serialization() {
     // `DecodeError`.
     let mut data = Vec::new();
     data.extend(b"YARA-X\0\0");
-    data.extend(13u32.to_le_bytes());
+    data.extend(14u32.to_le_bytes());
     data.extend(b"foo");
 
     assert!(matches!(
@@ -1569,6 +1569,41 @@ condition:
 }
 
 #[test]
+fn nesting_limit() {
+    // The parser accepts conditions where expressions are nested up to 100
+    // levels deep. The passes that recurse once per level (AST-to-IR and code
+    // emission) must handle the deepest accepted conditions without
+    // overflowing the stack — even on a 2 MiB test thread in dev builds and
+    // with a nested regexp at the bottom.
+    let src = format!(
+        "rule test {{ condition: filesize{} == 0 }}",
+        " | filesize".repeat(98)
+    );
+    assert!(Compiler::new().add_source(src.as_str()).is_ok());
+
+    let regexp = format!("/{}c{}/", "(a|".repeat(82), ")?".repeat(82));
+    let src = format!(
+        "rule test {{ condition: \"a\" matches {}{} }}",
+        regexp,
+        " == 1".repeat(98)
+    );
+    assert!(Compiler::new().add_source(src.as_str()).is_ok());
+
+    // One level past `MAX_AST_DEPTH` is rejected cleanly.
+    let src = format!(
+        "rule test {{ condition: filesize{} == 0 }}",
+        " | filesize".repeat(99)
+    );
+    assert!(
+        Compiler::new()
+            .add_source(src.as_str())
+            .unwrap_err()
+            .to_string()
+            .contains("nesting limit reached")
+    );
+}
+
+#[test]
 fn utf8_errors() {
     let mut src =
         "rule test {condition: true}".to_string().as_bytes().to_vec();
@@ -1712,6 +1747,146 @@ fn test_disable_includes() {
 1 | include "included_ok.yar"
   | ^^^^^^^^^^^^^^^^^^^^^^^^^ includes are disabled for this compilation"#
     );
+}
+
+#[test]
+fn test_include_outside_include_dir() {
+    // `a/a.yar` contains `include "../b/b.yar"`. When the include directory
+    // is restricted to `.../includes/a`, `../b/b.yar` escapes the allowed
+    // directory and must be rejected.
+    let mut compiler = Compiler::new();
+    let err = compiler
+        .add_include_dir("src/compiler/tests/testdata/includes/a")
+        .add_source(r#"include "a.yar""#)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(r#"error[E043]: include file not found"#));
+    assert!(err.contains(
+        r#"`../b/b.yar` not found in any of the include directories"#
+    ));
+
+    // Direct `..` traversal escaping the configured include directory must
+    // also fail.
+    let mut compiler = Compiler::new();
+    let err = compiler
+        .add_include_dir("src/compiler/tests/testdata/includes/a")
+        .add_source(r#"include "../included_ok.yar""#)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(r#"error[E043]: include file not found"#));
+    assert!(err.contains(
+        r#"`../included_ok.yar` not found in any of the include directories"#
+    ));
+
+    // Absolute path outside the configured include directory must fail.
+    let abs_path = std::path::Path::new(
+        "src/compiler/tests/testdata/includes/included_ok.yar",
+    )
+    .canonicalize()
+    .unwrap();
+
+    let mut compiler = Compiler::new();
+    let err = compiler
+        .add_include_dir("src/compiler/tests/testdata/includes/a")
+        .add_source(
+            format!(
+                r#"include "{}""#,
+                abs_path.to_str().unwrap().replace('\\', "/")
+            )
+            .as_str(),
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("error[E043]: include file not found"));
+
+    // Without `add_include_dir`, `..` traversal escaping the current working
+    // directory (`lib/`) into the workspace root must also fail.
+    let mut compiler = Compiler::new();
+    let err = compiler
+        .add_source(r#"include "../Cargo.toml""#)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("error[E043]: include file not found"));
+}
+
+#[test]
+fn test_include_non_regular_file() {
+    let mut compiler = Compiler::new();
+    let err = compiler
+        .add_include_dir("src/compiler/tests/testdata/includes")
+        .add_source(r#"include "a""#)
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(
+        err,
+        r#"error[E042]: error including file
+ --> line:1:1
+  |
+1 | include "a"
+  | ^^^^^^^^^^^ failed with error: included file is not a regular file"#
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_include_non_utf8_dir() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let unique =
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let base_dir = TempDir(std::env::temp_dir().join(format!(
+        "yara_x_include_test_{}_{}",
+        std::process::id(),
+        unique
+    )));
+    fs::create_dir_all(&base_dir.0).unwrap();
+
+    let non_utf8_dir = base_dir.0.join(OsStr::from_bytes(b"inc_\xff"));
+
+    // Some filesystems (such as APFS on macOS) reject non-UTF-8 directory
+    // names at the OS level, whereas Linux filesystems like ext4/tmpfs allow
+    // them.
+    if fs::create_dir(&non_utf8_dir).is_err() {
+        return;
+    }
+
+    fs::write(
+        non_utf8_dir.join("included.yar"),
+        b"rule test { condition: true }\n",
+    )
+    .unwrap();
+
+    let mut compiler = Compiler::new();
+    compiler
+        .add_include_dir(&non_utf8_dir)
+        .add_source(r#"include "included.yar""#)
+        .unwrap();
+
+    assert_eq!(compiler.warnings().len(), 1);
+    assert!(
+        compiler.warnings()[0]
+            .to_string()
+            .contains("inc_\u{fffd}/included.yar")
+    );
+
+    let rules = compiler.build();
+    let mut scanner = Scanner::new(&rules);
+    assert_eq!(scanner.scan(b"").unwrap().matching_rules().len(), 1);
 }
 
 #[test]
@@ -2097,6 +2272,66 @@ fn test_header_constraints() {
         &[],
         &[b"\x01", b"\x02", b"\x03"],
     );
+
+    // 3. Multi-byte reads at boundary offsets (e.g. `u32::MAX` on 32-bit
+    // targets and `i64::MAX` on 64-bit targets) must not panic or wrap around
+    // into header offsets starting at 0.
+    check_header_constraint(
+        "uint16(0xffffffff) == 0x2211",
+        &[],
+        &[b"\x11\x22\x00\x00", b"MZ\x00\x00"],
+    );
+    check_header_constraint(
+        "uint32(0xffffffff) == 0x44332211",
+        &[],
+        &[b"\x11\x22\x33\x44", b"\x22\x33\x44\x00"],
+    );
+    check_header_constraint(
+        "uint64(0xfffffff9) == 0x8877665544332211",
+        &[],
+        &[b"\x11\x22\x33\x44\x55\x66\x77\x88", b"\x88\x00\x00\x00"],
+    );
+    check_header_constraint(
+        "uint16(0) == 0x5a4d and uint32(0xffffffff) == 0x44332211",
+        &[],
+        &[b"MZ\x00\x00"],
+    );
+    check_header_constraint(
+        "uint64(0x7fffffffffffffff) == 0x8877665544332211",
+        &[],
+        &[b"\x11\x22\x33\x44\x55\x66\x77\x88"],
+    );
+
+    let rules = compile(
+        r#"
+        rule unconstrained_boundary_read {
+            strings:
+                $re = /foo|bar/
+            condition:
+                $re and uint32(0xffffffff) == 0x44332211
+        }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(rules.header_constraints().count(), 0);
+
+    let rules = compile(
+        r#"
+        rule header_with_boundary_read {
+            strings:
+                $re = /foo|bar/
+            condition:
+                $re and uint16(0) == 0x5a4d and uint32(0xffffffff) == 0x44332211
+        }
+        "#,
+    )
+    .unwrap();
+    let constraints: Vec<_> = rules.header_constraints().collect();
+    assert_eq!(constraints.len(), 1);
+    assert_eq!(
+        constraints[0].1,
+        &crate::compiler::HeaderConstraint::Constrained(vec![0x4d, 0x5a])
+    );
 }
 
 #[test]
@@ -2186,7 +2421,7 @@ fn test_rules_matches_many() {
         )
         .unwrap();
     let rules = compiler.build();
-    assert_eq!(rules.regex_sets.len(), 1);
+    assert_eq!(rules.regexp_sets.len(), 1);
     let mut scanner = Scanner::new(&rules);
     scanner.set_global("str_foo", "baz").unwrap();
     assert_eq!(scanner.scan(&[]).unwrap().matching_rules().len(), 1);
@@ -2221,7 +2456,7 @@ fn test_rules_matches_many() {
         )
         .unwrap();
     let rules = compiler.build();
-    assert!(rules.regex_sets.is_empty());
+    assert!(rules.regexp_sets.is_empty());
     let mut scanner = Scanner::new(&rules);
     scanner.set_global("str_foo", "bat").unwrap();
     assert_eq!(scanner.scan(&[]).unwrap().matching_rules().len(), 1);
@@ -2759,4 +2994,199 @@ fn test_non_matching_rules_page_boundary() {
     let results = scanner.scan(b"").unwrap();
     assert_eq!(results.non_matching_rules().len(), exact_page_rules);
     assert_eq!(results.non_matching_rules().count(), exact_page_rules);
+}
+
+#[test]
+fn test_regexp_empty_capture_and_nullable_repetitions() {
+    // 1. Empty capturing group repetitions matching empty strings must fail
+    //    immediately with "this regexp can match empty strings" instead of
+    //    spinning 4.29B iterations in `re::thompson::Compiler`.
+    for pat in [
+        "/(){4294967295,}/",
+        "/(){4294967295}/",
+        "/(){0,4294967295}/",
+        "/(?:()()){4294967295,}/",
+        "/((){2}){4294967295}/",
+    ] {
+        let rule =
+            format!("rule test {{ strings: $a = {pat} condition: $a }}");
+        let err = compile(rule.as_str()).unwrap_err();
+        assert!(
+            err.to_string().contains("this regexp can match empty strings"),
+            "{err}"
+        );
+    }
+
+    // 2. Nested bounded repetition `/(a{11}(){4294967295}){11}/` must compile
+    //    immediately and match 121 'a's (and not 120 'a's).
+    let rules = compile(
+        r#"
+        rule hang_nested_bounded {
+          strings:
+            $a = /(a{11}(){4294967295}){11}/
+          condition:
+            $a
+        }
+        "#,
+    )
+    .unwrap();
+    let mut scanner = Scanner::new(&rules);
+    assert_eq!(scanner.scan(&[b'a'; 120]).unwrap().matching_rules().len(), 0);
+    assert_eq!(scanner.scan(&[b'a'; 121]).unwrap().matching_rules().len(), 1);
+
+    // 3. Non-empty regexps with unbounded and bounded empty-capture repetitions
+    //    must compile and scan in O(1) without spinning or OOMing in `PikeVM`.
+    for pat in [
+        "/abcd(){4294967295,}/",
+        "/abcd(){4294967295}/",
+        "/abcd(){0,4294967295}/",
+        "/abcd(){1,4294967295}?/",
+        "/abcd(?:()()){4294967295,}/",
+    ] {
+        let rule = format!(
+            "rule test {{ strings: $a = {pat} ascii wide condition: $a }}"
+        );
+        let rules = compile(rule.as_str()).unwrap();
+        let mut scanner = Scanner::new(&rules);
+        assert_eq!(scanner.scan(b"abc").unwrap().matching_rules().len(), 0);
+        assert_eq!(scanner.scan(b"abcd").unwrap().matching_rules().len(), 1);
+        assert_eq!(
+            scanner
+                .scan(b"a\x00b\x00c\x00d\x00")
+                .unwrap()
+                .matching_rules()
+                .len(),
+            1
+        );
+    }
+
+    // 4. Bounded repetitions (> REPEAT_INSTR_THRESHOLD) of nullable sub-expressions
+    //    must unroll with distinct `SplitId`s so zero-length matches succeed,
+    //    while huge bounds fail cleanly with "regexp is too large".
+    for pat in [r"/abcd(x?){11}/", r"/abcd(x|\b){11}/"] {
+        let rule =
+            format!("rule test {{ strings: $a = {pat} condition: $a }}");
+        let rules = compile(rule.as_str()).unwrap();
+        let mut scanner = Scanner::new(&rules);
+        assert_eq!(scanner.scan(b"abcd").unwrap().matching_rules().len(), 1);
+        assert_eq!(
+            scanner.scan(b"abcdxxxxxxxxxxx").unwrap().matching_rules().len(),
+            1
+        );
+    }
+
+    for pat in [r"/abcd(x?){0,4294967295}/", r"/abcd(x|\b){0,4294967295}/"] {
+        let rule =
+            format!("rule test {{ strings: $a = {pat} condition: $a }}");
+        let err = compile(rule.as_str()).unwrap_err();
+        assert!(err.to_string().contains("regexp is too large"), "{err}");
+    }
+
+    // 5. Condition `matches` (`Hir::build_automata` with `WhichCaptures::None`)
+    //    must compile empty-capture repetitions without hitting `nfa_size_limit`.
+    let rules = compile(
+        r#"
+        rule cond_empty_captures {
+          condition:
+            "foo" matches /(){4294967295,}/ and
+            "foo" matches /(){4294967295}/ and
+            ("foo" matches /bar(){4294967295,}/ or "foo" matches /foo(){4294967295}/)
+        }
+        "#,
+    )
+    .unwrap();
+    let mut scanner = Scanner::new(&rules);
+    assert_eq!(scanner.scan(b"").unwrap().matching_rules().len(), 1);
+}
+
+#[test]
+fn test_too_many_atoms() {
+    use crate::errors::CompileError;
+
+    // 1. Single rule with multiple regexps exceeding the atom limit is
+    //    rejected and rolled back, leaving the compiler usable.
+    let mut compiler = Compiler::new();
+    compiler.max_atoms(100);
+    compiler
+        .add_source(r#"rule before { strings: $a = "wxyz" condition: $a }"#)
+        .unwrap();
+
+    // Each regexp yields 4 * 4 = 16 atoms; 7 regexps yield 112 atoms (> 100).
+    let mut src = String::from("rule too_many_regexps { strings:\n");
+    for n in 1..=7 {
+        src.push_str(&format!("$ = /[a-d][a-d].{{{n}}}/s\n"));
+    }
+    src.push_str("condition: any of them }");
+
+    let err = compiler.add_source(src.as_str()).unwrap_err();
+    assert!(matches!(err, CompileError::TooManyAtoms(_)), "{err}");
+
+    // 2. Single rule with `xor` text string (256 atoms) exceeding the limit.
+    let err = compiler
+        .add_source(
+            r#"rule too_many_xor { strings: $a = "wxyz" xor condition: $a }"#,
+        )
+        .unwrap_err();
+    assert!(matches!(err, CompileError::TooManyAtoms(_)), "{err}");
+
+    // 3. Single chained regexp exceeding the limit stops early and rolls back.
+    let err = compiler
+        .add_source(
+            r#"rule too_many_chained {
+                strings:
+                    $a = /[a-d][a-d].*[a-d][a-d].*[a-d][a-d].*[a-d][a-d].*[a-d][a-d].*[a-d][a-d].*[a-d][a-d]/s
+                condition:
+                    $a
+            }"#,
+        )
+        .unwrap_err();
+    assert!(matches!(err, CompileError::TooManyAtoms(_)), "{err}");
+
+    // 4. Single alternation of literals exceeding the limit rolls back.
+    let mut alt = String::from("rule too_many_alt { strings: $a = /");
+    for i in 0..105 {
+        if i > 0 {
+            alt.push('|');
+        }
+        alt.push_str(&format!("lit{i:03}"));
+    }
+    alt.push_str("/ condition: $a }");
+    let err = compiler.add_source(alt.as_str()).unwrap_err();
+    assert!(matches!(err, CompileError::TooManyAtoms(_)), "{err}");
+
+    // 5. Accumulation across namespaces: the first rule succeeds, the second
+    //    pushes the total over the limit and is rejected, while the first is
+    //    preserved.
+    compiler.new_namespace("ns1");
+    compiler
+        .add_source(
+            r#"rule ok_ns1 {
+                strings:
+                    $a = /[a-d][a-d][a-d]/
+                condition:
+                    $a
+            }"#,
+        )
+        .unwrap(); // 1 + 64 = 65 atoms
+
+    compiler.new_namespace("ns2");
+    let err = compiler
+        .add_source(
+            r#"rule fail_ns2 {
+                strings:
+                    $a = /[e-h][e-h][e-h]/
+                condition:
+                    $a
+            }"#,
+        )
+        .unwrap_err(); // 65 + 64 = 129 > 100
+    assert!(matches!(err, CompileError::TooManyAtoms(_)), "{err}");
+
+    // Compiler builds without panicking and only the accepted rules remain.
+    let rules = compiler.build();
+    assert_eq!(rules.atoms().len(), 65);
+    let mut scanner = Scanner::new(&rules);
+    assert_eq!(scanner.scan(b"wxyz").unwrap().matching_rules().len(), 1);
+    assert_eq!(scanner.scan(b"aaa").unwrap().matching_rules().len(), 1);
+    assert_eq!(scanner.scan(b"eee").unwrap().matching_rules().len(), 0);
 }
