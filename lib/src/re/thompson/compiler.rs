@@ -10,13 +10,13 @@ use itertools::Itertools;
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt::{Display, Formatter};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::iter::zip;
 use std::mem::{size_of, size_of_val};
 use std::slice::IterMut;
 
 use bitvec::array::BitArray;
 use bitvec::order::Lsb0;
+use smallvec::{SmallVec, smallvec};
 
 use regex_syntax::hir;
 use regex_syntax::hir::literal::Seq;
@@ -200,28 +200,61 @@ impl Compiler {
         code.append(&mut fwd_code.into_inner());
 
         // `bck_code_start` will contain the offset within the `code` vector
-        // where the backward code resides.
+        // where the backward code resides. Any atom whose backward code
+        // unconditionally reaches `Instr::Match` (either directly or via
+        // forward alternation exit `Instr::Jump`s) has nothing to match
+        // backwards (`bck_match_len == 0`), so it doesn't need `bck_code`.
         let bck_code_start = code.len();
-        code.append(&mut bck_code.into_inner());
+        let bck_slice = bck_code.as_slice();
 
-        let re_atoms = atoms
+        let re_atoms: Vec<_> = atoms
             .into_iter()
             .map(|a| re::RegexpAtom {
                 atom: a.atom,
                 fwd_code: Some(FwdCodeLoc::from(
                     a.code_loc.fwd + fwd_code_start,
                 )),
-                bck_code: Some(BckCodeLoc::from(
-                    a.code_loc.bck + bck_code_start,
-                )),
+                bck_code: (!Self::is_noop_bck_code(bck_slice, a.code_loc.bck))
+                    .then(|| {
+                        BckCodeLoc::from(a.code_loc.bck + bck_code_start)
+                    }),
             })
             .collect();
+
+        // `compile_internal` always generates backward bytecode for the whole
+        // regexp, since atom selection happens while visiting the HIR. However,
+        // if every selected atom starts at the beginning of the regexp, all of
+        // them have `bck_code == None` and the backward bytecode is completely
+        // unreachable. Only append `bck_code` to `code` when at least one atom
+        // actually references it (at `bck_code_start`, which equals `code.len()`
+        // right before appending), avoiding dead bytecode in compiled rules.
+        if re_atoms.iter().any(|a| a.bck_code.is_some()) {
+            code.append(&mut bck_code.into_inner());
+        }
 
         Ok(re_atoms)
     }
 }
 
 impl Compiler {
+    /// Returns true if executing `bck_code` starting at `ip` unconditionally
+    /// reaches `Instr::Match` without consuming any bytes or checking any
+    /// look-around assertions.
+    fn is_noop_bck_code(bck_code: &[u8], mut ip: usize) -> bool {
+        loop {
+            match InstrParser::decode_instr(&bck_code[ip..], false).0 {
+                Instr::Match => return true,
+                Instr::Jump(offset) => {
+                    let offset = isize::from(offset);
+                    if offset <= 0 {
+                        return false;
+                    }
+                    ip = ip.checked_add_signed(offset).unwrap();
+                }
+                _ => return false,
+            }
+        }
+    }
     /// Repetition threshold. Repetitions with count(s) below or equal to this
     /// threshold are unrolled (i.e., the repeated expression's code is
     /// duplicated). Repetitions with count(s) above this threshold are
@@ -763,10 +796,52 @@ impl Compiler {
         Ok(split_loc)
     }
 
-    fn visit_pre_repetition(&mut self, rep: &Repetition) -> Result<(), Error> {
-        let nested_rep = self.repeats.last().cloned().unwrap_or(false);
+    /// Returns true if compiling `hir` produces zero PikeVM instructions.
+    ///
+    /// While `regex_syntax` folds `(?:){N,}` into `HirKind::Empty`, it
+    /// preserves `HirKind::Repetition` when the repeated sub-expression wraps
+    /// empty capturing groups (e.g. `(){N,}`, `(?:()()){N,}`, `((){2}){N,}`).
+    /// Because [`Compiler`] emits no instructions for `HirKind::Capture`, such
+    /// sub-expressions have zero code size.
+    fn emits_no_code(hir: &Hir) -> bool {
+        let mut stack: SmallVec<[&Hir; 4]> = smallvec![hir];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                HirKind::Empty => {}
+                HirKind::Literal(lit) if lit.0.is_empty() => {}
+                HirKind::Capture(cap) => stack.push(&cap.sub),
+                HirKind::Repetition(rep) => {
+                    if rep.max != Some(0) {
+                        stack.push(&rep.sub);
+                    }
+                }
+                HirKind::Concat(subs) => stack.extend(subs.iter()),
+                HirKind::Literal(_)
+                | HirKind::Class(_)
+                | HirKind::Look(_)
+                | HirKind::Alternation(_) => return false,
+            }
+        }
+        true
+    }
 
-        match (rep.min, rep.max, rep.greedy, nested_rep) {
+    fn visit_pre_repetition(&mut self, rep: &Repetition) -> Result<(), Error> {
+        if Self::emits_no_code(&rep.sub) {
+            return Ok(());
+        }
+
+        let nested_rep = self.repeats.last().cloned().unwrap_or(false);
+        // `REPEAT_GREEDY` and `REPEAT_NON_GREEDY` jump back to the same
+        // instruction offsets (and `SplitId`s) across iterations, so they can
+        // only be used when `rep.sub` is guaranteed to consume at least one
+        // input byte per iteration. Otherwise `epsilon_closure` could either
+        // spin `max` times at a single byte offset (e.g. `(?:\b){0,4294967295}`)
+        // or drop threads when revisiting an already-executed `SplitId` at the
+        // same offset (e.g. `(x?){11}`).
+        let can_use_repeat_instr = !nested_rep
+            && rep.sub.properties().minimum_len().is_some_and(|len| len > 0);
+
+        match (rep.min, rep.max, rep.greedy, can_use_repeat_instr) {
             // e* and e*?
             //
             // l1: split_a l3  ( split_b for the non-greedy e*? )
@@ -809,7 +884,7 @@ impl Compiler {
             // l3: repeat l2, 0, max
             // l4:
             //
-            (0, Some(max), greedy, false)
+            (0, Some(max), greedy, true)
                 if max > Self::REPEAT_INSTR_THRESHOLD =>
             {
                 let l1 = self.emit_instr(if greedy {
@@ -829,7 +904,7 @@ impl Compiler {
             // l2: repeat l1, min-1, max-1
             // l3:
             //
-            (min, Some(max), _, false)
+            (min, Some(max), _, true)
                 if min > Self::REPEAT_INSTR_THRESHOLD
                     || max > Self::REPEAT_INSTR_THRESHOLD =>
             {
@@ -868,6 +943,10 @@ impl Compiler {
         &mut self,
         rep: &Repetition,
     ) -> Result<CodeLoc, Error> {
+        if Self::emits_no_code(&rep.sub) {
+            return Ok(self.location());
+        }
+
         match (rep.min, rep.max, rep.greedy, self.repeats.pop().unwrap()) {
             // e* and e*?
             //
@@ -913,6 +992,8 @@ impl Compiler {
                 let start = self.bookmarks.pop().unwrap();
                 let end = self.location();
 
+                debug_assert!(end.fwd > start.fwd && end.bck > start.bck);
+
                 // The first copy of `e` was already emitted when the children
                 // of the repetition node was visited. Clone the code for `e`
                 // n - 3 times, which result in n - 2 copies.
@@ -952,15 +1033,7 @@ impl Compiler {
                     + size_of::<SplitId>()
                     + size_of::<instr::Offset>();
 
-                let best_atoms = self.best_atoms_stack.last_mut().unwrap();
-
-                for atom in best_atoms.iter_mut() {
-                    if atom.code_loc.bck_seq_id == start.bck_seq_id
-                        && atom.code_loc.bck >= start.bck
-                    {
-                        atom.code_loc.bck += adjustment;
-                    }
-                }
+                self.adjust_atoms_bck_loc(start, adjustment);
 
                 Ok(start)
             }
@@ -971,10 +1044,8 @@ impl Compiler {
             // l3: repeat l1, 0, max
             // l4:
             //
-            (0, Some(max), greedy, true)
-                if max > Self::REPEAT_INSTR_THRESHOLD =>
-            {
-                debug_assert!(max > 0);
+            (0, Some(max), greedy, true) => {
+                debug_assert!(max > Self::REPEAT_INSTR_THRESHOLD);
 
                 let l1 = self.bookmarks.pop().unwrap();
                 let l2 = self.bookmarks.pop().unwrap();
@@ -1003,12 +1074,13 @@ impl Compiler {
             // l2: repeat l1, min-1, max-1
             // l3:
             //
-            (min, Some(max), greedy, true)
-                if min > Self::REPEAT_INSTR_THRESHOLD
-                    || max > Self::REPEAT_INSTR_THRESHOLD =>
-            {
+            (min, Some(max), greedy, true) => {
                 debug_assert!(min > 0);
                 debug_assert!(max >= min);
+                debug_assert!(
+                    min > Self::REPEAT_INSTR_THRESHOLD
+                        || max > Self::REPEAT_INSTR_THRESHOLD
+                );
 
                 let start = self.bookmarks.pop().unwrap();
                 let end = self.location();
@@ -1041,8 +1113,8 @@ impl Compiler {
             }
             // This is the approach used when the repetition can't be expressed
             // using a REPEAT instruction. This happens when we have nested
-            // repetitions, or when the number of repetitions is not large
-            // enough.
+            // repetitions, when the repeated expression can match the empty
+            // string, or when the number of repetitions is not large enough.
             //
             // e{min,max}  min >= 0
             //
@@ -1062,6 +1134,8 @@ impl Compiler {
                 // starts and ends.
                 let start = self.bookmarks.pop().unwrap();
                 let end = self.location();
+
+                debug_assert!(end.fwd > start.fwd && end.bck > start.bck);
 
                 // The first copy of `e` has already been emitted while
                 // visiting the child nodes. Make min - 1 clones of `e`.
@@ -1087,16 +1161,7 @@ impl Compiler {
                 if min > 1 {
                     let adjustment =
                         (min - 1) as usize * (end.bck - start.bck);
-
-                    let best_atoms = self.best_atoms_stack.last_mut().unwrap();
-
-                    for atom in best_atoms.iter_mut() {
-                        if atom.code_loc.bck_seq_id == start.bck_seq_id
-                            && atom.code_loc.bck >= start.bck
-                        {
-                            atom.code_loc.bck += adjustment;
-                        }
-                    }
+                    self.adjust_atoms_bck_loc(start, adjustment);
                 }
 
                 let end = self.location();
@@ -1107,6 +1172,17 @@ impl Compiler {
                 }
 
                 Ok(start)
+            }
+        }
+    }
+
+    fn adjust_atoms_bck_loc(&mut self, start: CodeLoc, adjustment: usize) {
+        let best_atoms = self.best_atoms_stack.last_mut().unwrap();
+        for atom in best_atoms.iter_mut() {
+            if atom.code_loc.bck_seq_id == start.bck_seq_id
+                && atom.code_loc.bck >= start.bck
+            {
+                atom.code_loc.bck += adjustment;
             }
         }
     }
@@ -1440,7 +1516,7 @@ pub(crate) struct InstrSeq {
     /// The unique ID that identifies this sequence of instructions.
     seq_id: u64,
     /// A vector that contains the PikeVM code.
-    seq: Cursor<Vec<u8>>,
+    seq: Vec<u8>,
     /// The ID that will identify the next split instruction emitted in this
     /// sequence.
     split_id: SplitId,
@@ -1448,7 +1524,7 @@ pub(crate) struct InstrSeq {
 
 impl AsRef<[u8]> for InstrSeq {
     fn as_ref(&self) -> &[u8] {
-        self.seq.get_ref().as_slice()
+        self.seq.as_slice()
     }
 }
 
@@ -1458,46 +1534,40 @@ impl InstrSeq {
 
     /// Creates a new [`InstrSeq`].
     pub fn new() -> Self {
-        Self {
-            seq_id: 0,
-            seq: Cursor::new(Vec::new()),
-            split_id: SplitId::default(),
-        }
+        Self { seq_id: 0, seq: Vec::new(), split_id: SplitId::default() }
     }
 
     /// Creates a new [`InstrSeq`] with an ID that is `self.seq_id() + 1`.
     pub fn next(&self) -> Self {
         Self {
             seq_id: self.seq_id + 1,
-            seq: Cursor::new(Vec::new()),
+            seq: Vec::new(),
             split_id: self.split_id,
         }
     }
 
     /// Returns the code in the [`InstrSeq`] as a slice of raw bytes.
     pub fn as_slice(&self) -> &[u8] {
-        self.seq.get_ref().as_slice()
+        self.seq.as_slice()
     }
 
     /// Consumes the [`InstrSeq`] and returns the inner vector that contains
     /// the code.
     pub fn into_inner(self) -> Vec<u8> {
-        self.seq.into_inner()
+        self.seq
     }
 
     /// Appends another sequence to this one.
     pub fn append(&mut self, other: &Self) -> Result<(), Error> {
-        self.write(other.seq.get_ref().as_slice())
+        self.write(other.seq.as_slice())
     }
 
     #[inline]
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.seq.get_ref().len().saturating_add(bytes.len())
-            > Self::MAX_CODE_SIZE
-        {
+        if self.seq.len().saturating_add(bytes.len()) > Self::MAX_CODE_SIZE {
             return Err(Error::TooLarge);
         }
-        self.seq.write_all(bytes).unwrap();
+        self.seq.extend_from_slice(bytes);
         Ok(())
     }
 
@@ -1508,7 +1578,7 @@ impl InstrSeq {
     /// the location where the next instruction will be put.
     #[inline]
     pub fn location(&self) -> usize {
-        self.seq.position() as usize
+        self.seq.len()
     }
 
     /// Returns the unique ID associated to the instruction sequence.
@@ -1690,21 +1760,17 @@ impl InstrSeq {
         let location = self.location();
         let clone_len = end - start;
 
-        if self.seq.get_ref().len().saturating_add(clone_len)
-            > Self::MAX_CODE_SIZE
-        {
+        if self.seq.len().saturating_add(clone_len) > Self::MAX_CODE_SIZE {
             return Err(Error::TooLarge);
         }
 
         // Extend the code by cloning the ranges that go from `start` to `end`.
-        self.seq.get_mut().extend_from_within(start..end);
+        self.seq.extend_from_within(start..end);
 
         // Every split instruction has an ID, we don't want the split
         // instructions in the cloned code to have the same IDs as in the
         // original code, those IDs need to be updated.
         self.update_split_ids(location)?;
-
-        self.seq.seek(SeekFrom::Current(end as i64 - start as i64)).unwrap();
 
         Ok(location)
     }
@@ -1717,8 +1783,7 @@ impl InstrSeq {
     /// code doesn't have split instruction with the same IDs as in the original
     /// code.
     fn update_split_ids(&mut self, location: usize) -> Result<(), Error> {
-        let code =
-            self.seq.get_mut().as_mut_slice().get_mut(location..).unwrap();
+        let code = self.seq.get_mut(location..).unwrap();
 
         let mut offsets = Vec::new();
 
@@ -1761,39 +1826,20 @@ impl InstrSeq {
     /// its arguments, like [`Instr::Jump`], [`Instr::SplitA`], [`Instr::SplitB`],
     /// etc.
     pub fn patch_instr(&mut self, location: usize, offset: instr::Offset) {
-        // Save the current position for the forward code in order to restore
-        // it later.
-        let saved_loc = self.location();
+        assert_eq!(self.seq[location], OPCODE_PREFIX);
 
-        // Seek to the position indicated by `location`.
-        self.seq.seek(SeekFrom::Start(location as u64)).unwrap();
-
-        let mut buf = [0; 2];
-        self.seq.read_exact(&mut buf).unwrap();
-
-        // Make sure that we have some `split` or `jump` instruction at the
-        // given location.
-        assert_eq!(buf[0], OPCODE_PREFIX);
-
-        match buf[1] {
-            Instr::JUMP | Instr::REPEAT_GREEDY | Instr::REPEAT_NON_GREEDY => {}
+        let offset_pos = match self.seq[location + 1] {
+            Instr::JUMP | Instr::REPEAT_GREEDY | Instr::REPEAT_NON_GREEDY => {
+                location + 2
+            }
             Instr::SPLIT_A | Instr::SPLIT_B => {
-                self.seq
-                    // Skip the split ID.
-                    .seek(SeekFrom::Current(size_of::<SplitId>() as i64))
-                    .unwrap();
+                location + 2 + size_of::<SplitId>()
             }
-            _ => {
-                unreachable!()
-            }
-        }
+            _ => unreachable!(),
+        };
 
-        // Write the given offset after the instruction opcode. This will
-        // overwrite any existing offsets, usually initialized with 0.
-        self.seq.write_all(offset.to_le_bytes().as_slice()).unwrap();
-
-        // Restore to the previous current position.
-        self.seq.seek(SeekFrom::Start(saved_loc as u64)).unwrap();
+        self.seq[offset_pos..offset_pos + size_of::<instr::Offset>()]
+            .copy_from_slice(&offset.to_le_bytes());
     }
 
     /// Patches the offsets of the [`Instr::SplitN`] instruction at the given
@@ -1806,45 +1852,26 @@ impl InstrSeq {
     pub fn patch_split_n<I: ExactSizeIterator<Item = instr::Offset>>(
         &mut self,
         location: usize,
-        mut offsets: I,
+        offsets: I,
     ) {
-        // Save the current location for the forward code in order to restore
-        // it later.
-        let saved_loc = self.location();
+        assert_eq!(self.seq[location], OPCODE_PREFIX);
+        assert_eq!(self.seq[location + 1], Instr::SPLIT_N);
 
-        // Seek to the position indicated by `location`.
-        self.seq.seek(SeekFrom::Start(location as u64)).unwrap();
+        let num_alt_pos = location + 2 + size_of::<SplitId>();
+        let n = NumAlt::from_le_bytes(
+            self.seq[num_alt_pos..num_alt_pos + size_of::<NumAlt>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
-        // Read the first few bytes in the opcode, corresponding to the prefix,
-        // the opcode itself, and the split id respectively.
-        let mut opcode = [0; 2 + size_of::<SplitId>()];
-        self.seq.read_exact(&mut opcode).unwrap();
+        assert_eq!(n, offsets.len());
 
-        // Make sure that we have some `split` or `jump` instruction at the
-        // given location.
-        assert_eq!(opcode[0], OPCODE_PREFIX);
-        assert_eq!(opcode[1], Instr::SPLIT_N);
-
-        let read_num_alternatives = |c: &mut Cursor<Vec<u8>>| -> NumAlt {
-            let mut buf = [0_u8; size_of::<NumAlt>()];
-            c.read_exact(&mut buf).unwrap();
-            NumAlt::from_le_bytes(buf)
-        };
-
-        let n = read_num_alternatives(&mut self.seq);
-
-        // Make sure that the number of offsets passed to this function is
-        // equal the number of alternatives.
-        assert_eq!(n as usize, offsets.len());
-
-        for _ in 0..n {
-            self.seq
-                .write_all(offsets.next().unwrap().to_le_bytes().as_slice())
-                .unwrap();
+        let mut pos = num_alt_pos + size_of::<NumAlt>();
+        for offset in offsets {
+            self.seq[pos..pos + size_of::<instr::Offset>()]
+                .copy_from_slice(&offset.to_le_bytes());
+            pos += size_of::<instr::Offset>();
         }
-
-        // Restore to the previous current position.
-        self.seq.seek(SeekFrom::Start(saved_loc as u64)).unwrap();
     }
 }
 
@@ -1852,7 +1879,7 @@ impl Display for InstrSeq {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f)?;
 
-        for (instr, addr) in InstrParser::new(self.seq.get_ref().as_slice()) {
+        for (instr, addr) in InstrParser::new(self.seq.as_slice()) {
             match instr {
                 Instr::AnyByte => {
                     writeln!(f, "{addr:05x}: ANY_BYTE")?;

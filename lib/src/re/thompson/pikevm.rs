@@ -1,11 +1,10 @@
 use bitvec::array::BitArray;
-use std::cell::Cell;
 use std::mem;
 use std::ops::ControlFlow;
 
 use super::instr::{Instr, InstrParser, Offset};
 use crate::re::thompson::instr::SplitId;
-use crate::re::{CodeLoc, DEFAULT_SCAN_LIMIT, WideIter};
+use crate::re::{CodeLoc, DEFAULT_SCAN_LIMIT, InputByte, WideIter};
 
 type Thread = (u32, u32);
 
@@ -58,6 +57,12 @@ impl<'r> PikeVM<'r> {
         self
     }
 
+    /// Returns the maximum number of steps scanned by the VM before aborting.
+    #[inline]
+    pub fn get_scan_limit(&self) -> u32 {
+        self.scan_limit
+    }
+
     /// Executes VM code starting at the `start` location and calls `f` for
     /// each match found. The `right` slice contains the bytes at the right
     /// of the starting point (i.e: from the starting point until the end of
@@ -88,41 +93,33 @@ impl<'r> PikeVM<'r> {
     {
         match (start.backwards(), wide) {
             // Going forward, not wide.
-            (false, false) => {
-                self.try_match_impl(start, right.iter(), left.iter().rev(), f)
-            }
+            (false, false) => self.try_match_impl(
+                start,
+                right.iter().map(|b| InputByte::Valid(*b)),
+                left.iter().rev().map(|b| InputByte::Valid(*b)),
+                f,
+            ),
             // Going forward, wide.
-            (false, true) => {
-                let error_fwd = Cell::new(None);
-                let error_bck = Cell::new(None);
-                self.try_match_impl(
-                    start,
-                    WideIter::non_zero_first(right.iter(), &error_fwd),
-                    WideIter::zero_first(left.iter().rev(), &error_bck),
-                    |match_len| match error_fwd.get() {
-                        Some(pos) if pos < match_len => ControlFlow::Break(()),
-                        _ => f(match_len * 2),
-                    },
-                )
-            }
+            (false, true) => self.try_match_impl(
+                start,
+                WideIter::non_zero_first(right.iter()),
+                WideIter::zero_first(left.iter().rev()),
+                |match_len| f(match_len * 2),
+            ),
             // Going backward, not wide.
-            (true, false) => {
-                self.try_match_impl(start, left.iter().rev(), right.iter(), f)
-            }
+            (true, false) => self.try_match_impl(
+                start,
+                left.iter().rev().map(|b| InputByte::Valid(*b)),
+                right.iter().map(|b| InputByte::Valid(*b)),
+                f,
+            ),
             // Going backward, wide.
-            (true, true) => {
-                let error_fwd = Cell::new(None);
-                let error_bck = Cell::new(None);
-                self.try_match_impl(
-                    start,
-                    WideIter::zero_first(left.iter().rev(), &error_fwd),
-                    WideIter::non_zero_first(right.iter(), &error_bck),
-                    |match_len| match error_fwd.get() {
-                        Some(pos) if pos < match_len => ControlFlow::Break(()),
-                        _ => f(match_len * 2),
-                    },
-                )
-            }
+            (true, true) => self.try_match_impl(
+                start,
+                WideIter::zero_first(left.iter().rev()),
+                WideIter::non_zero_first(right.iter()),
+                |match_len| f(match_len * 2),
+            ),
         }
     }
 
@@ -153,7 +150,7 @@ impl<'r> PikeVM<'r> {
     /// that appear right before the start of `fwd_input` for matching some
     /// look-around assertions that need information about the surrounding
     /// bytes.
-    fn try_match_impl<'a, C, F, B>(
+    fn try_match_impl<C, F, B>(
         &mut self,
         start: C,
         mut fwd_input: F,
@@ -161,8 +158,8 @@ impl<'r> PikeVM<'r> {
         mut f: impl FnMut(usize) -> ControlFlow<()>,
     ) where
         C: CodeLoc,
-        F: Iterator<Item = &'a u8>,
-        B: Iterator<Item = &'a u8>,
+        F: Iterator<Item = InputByte>,
+        B: Iterator<Item = InputByte>,
     {
         let mut current_pos = 0;
         let mut curr_byte = fwd_input.next();
@@ -210,9 +207,11 @@ impl<'r> PikeVM<'r> {
                 );
 
                 let is_match = match instr {
-                    Instr::AnyByte => curr_byte.is_some(),
+                    Instr::AnyByte => {
+                        matches!(curr_byte, Some(InputByte::Valid(_)))
+                    }
                     Instr::Byte(byte) => {
-                        matches!(curr_byte, Some(b) if *b == byte)
+                        curr_byte == Some(InputByte::Valid(byte))
                     }
                     // `Instr::Bytes` matches a sequence of literal bytes in
                     // a single VM step. This bypasses standard VM thread
@@ -226,7 +225,7 @@ impl<'r> PikeVM<'r> {
                                 None => break 'is_match false,
                             };
 
-                            if !matches!(curr_byte, Some(b) if *b == first) {
+                            if curr_byte != Some(InputByte::Valid(first)) {
                                 break 'is_match false;
                             }
 
@@ -235,7 +234,7 @@ impl<'r> PikeVM<'r> {
                                 None => break 'is_match true,
                             };
 
-                            if !matches!(next_byte, Some(b) if *b == second) {
+                            if next_byte != Some(InputByte::Valid(second)) {
                                 break 'is_match false;
                             }
 
@@ -248,13 +247,13 @@ impl<'r> PikeVM<'r> {
                             for expected_byte in lit_bytes.by_ref() {
                                 curr_byte = fwd_input.next();
                                 match curr_byte {
-                                    Some(curr_byte) => {
+                                    Some(InputByte::Valid(curr_byte)) => {
                                         current_pos += 1;
-                                        if *curr_byte != expected_byte {
+                                        if curr_byte != expected_byte {
                                             break 'is_match false;
                                         }
                                     }
-                                    None => break 'is_match false,
+                                    _ => break 'is_match false,
                                 }
                             }
 
@@ -271,16 +270,16 @@ impl<'r> PikeVM<'r> {
                         is_match
                     }
                     Instr::MaskedByte { byte, mask } => {
-                        matches!(curr_byte, Some(b) if *b & mask == byte)
+                        matches!(curr_byte, Some(InputByte::Valid(b)) if b & mask == byte)
                     }
                     Instr::CaseInsensitiveChar(byte) => {
-                        matches!(curr_byte, Some(b) if b.to_ascii_lowercase() == byte)
+                        matches!(curr_byte, Some(InputByte::Valid(b)) if b.to_ascii_lowercase() == byte)
                     }
                     Instr::ClassBitmap(class) => {
-                        matches!(curr_byte, Some(b) if class.contains(*b))
+                        matches!(curr_byte, Some(InputByte::Valid(b)) if class.contains(b))
                     }
                     Instr::ClassRanges(class) => {
-                        matches!(curr_byte, Some(b) if class.contains(*b))
+                        matches!(curr_byte, Some(InputByte::Valid(b)) if class.contains(b))
                     }
                     Instr::Match => match f(current_pos) {
                         ControlFlow::Break(_) => break,
@@ -390,15 +389,38 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
     code: &[u8],
     start: C,
     rep_count: u32,
-    curr_byte: Option<&u8>,
-    prev_byte: Option<&u8>,
+    curr_byte: Option<InputByte>,
+    prev_byte: Option<InputByte>,
     state: &mut EpsilonClosureState,
     closure: &mut Vec<Thread>,
 ) {
     state.threads.push((start.location().try_into().unwrap(), rep_count));
     state.dirty = true;
 
-    let is_word_char = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    // Normalize neighboring bytes into input text order `(left, right)` once
+    // so look-around assertions don't depend on the VM's scan direction.
+    let (left, right) = if start.backwards() {
+        (curr_byte, prev_byte)
+    } else {
+        (prev_byte, curr_byte)
+    };
+
+    let is_word = |b: Option<InputByte>| {
+        matches!(
+            b,
+            Some(InputByte::Valid(c)) if c == b'_' || c.is_ascii_alphanumeric()
+        )
+    };
+
+    // True at start/end of input (`a` is `None`), or immediately after/before
+    // `\n` or `\r` provided the cursor is not splitting a `\r\n` / `\n\r` pair.
+    let is_line_boundary = |a: Option<InputByte>, b: Option<InputByte>| match a
+    {
+        None => true,
+        Some(InputByte::Valid(b'\n')) => b != Some(InputByte::Valid(b'\r')),
+        Some(InputByte::Valid(b'\r')) => b != Some(InputByte::Valid(b'\n')),
+        _ => false,
+    };
 
     let apply_offset = |ip: u32, offset: Offset| -> u32 {
         (ip as isize).saturating_add(offset.into()).try_into().unwrap()
@@ -474,213 +496,29 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
             Instr::Jump(offset) => {
                 state.threads.push((apply_offset(ip, offset), rep_count));
             }
-            Instr::Start => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    // Going forward, no previous byte, we are at the start of
-                    // the input, this is a match.
-                    (false, None, _) => true,
-                    // Going backward, no current byte, we are at the start
-                    // of the input, this is a match.
-                    (true, _, None) => true,
-                    _ => false,
+            Instr::Start
+            | Instr::End
+            | Instr::LineStart
+            | Instr::LineEnd
+            | Instr::WordStart
+            | Instr::WordEnd
+            | Instr::WordStartHalf
+            | Instr::WordEndHalf
+            | Instr::WordBoundary
+            | Instr::WordBoundaryNeg => {
+                let is_match = match instr {
+                    Instr::Start => left.is_none(),
+                    Instr::End => right.is_none(),
+                    Instr::LineStart => is_line_boundary(left, right),
+                    Instr::LineEnd => is_line_boundary(right, left),
+                    Instr::WordStart => !is_word(left) && is_word(right),
+                    Instr::WordEnd => is_word(left) && !is_word(right),
+                    Instr::WordStartHalf => !is_word(left),
+                    Instr::WordEndHalf => !is_word(right),
+                    Instr::WordBoundary => is_word(left) != is_word(right),
+                    Instr::WordBoundaryNeg => is_word(left) == is_word(right),
+                    _ => unreachable!(),
                 };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::End => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    // Going forward, no current byte, we are at the end of the
-                    // data, this is a match.
-                    (false, _, None) => true,
-                    // Going backward, no previous byte, we are at the end of
-                    // the data, this is a match.
-                    (true, None, _) => true,
-                    _ => false,
-                };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::LineStart => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    // Going forward, no previous byte, we are at the start of
-                    // the input, this is a match.
-                    (false, None, _) => true,
-                    // Going forward, no current byte, previous byte was \n,
-                    // this is a match.
-                    (false, Some(b'\n'), None) => true,
-                    // Going forward, no current byte, previous byte was \r,
-                    // this is a match.
-                    (false, Some(b'\r'), None) => true,
-                    // Going forward, previous byte was \n, this is match if
-                    // current byte is not \r.
-                    (false, Some(b'\n'), Some(curr_byte)) => {
-                        *curr_byte != b'\r'
-                    }
-                    // Going forward, previous byte was \r, this is match if
-                    // current byte is not \n.
-                    (false, Some(b'\r'), Some(curr_byte)) => {
-                        *curr_byte != b'\n'
-                    }
-                    // Going backward, no current byte, we are at the start
-                    // of the input, this is a match.
-                    (true, _, None) => true,
-                    // Going backward, no previous byte and current byte is \n,
-                    // this is a match.
-                    (true, None, Some(b'\n')) => true,
-                    // Going backward, no previous byte and current byte is \r,
-                    // this is a match.
-                    (true, None, Some(b'\r')) => true,
-                    // Going backward, current byte is \n, this is a match if
-                    // previous byte was not \r.
-                    (true, Some(prev_byte), Some(b'\n')) => {
-                        *prev_byte != b'\r'
-                    }
-                    // Going backward, current byte is \r, this is a match if
-                    // previous byte was not \n.
-                    (true, Some(prev_byte), Some(b'\r')) => {
-                        *prev_byte != b'\n'
-                    }
-                    _ => false,
-                };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::LineEnd => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    // Going forward, no current byte, we are at the end of the
-                    // data, this is a match.
-                    (false, _, None) => true,
-                    // Going forward, no previous byte and current byte is \n,
-                    // this is a match.
-                    (false, None, Some(b'\n')) => true,
-                    // Going forward, no previous byte and current byte is \t,
-                    // this is a match.
-                    (false, None, Some(b'\t')) => true,
-                    // Going forward, current byte is \n, this is a match if
-                    // the previous byte is not \r.
-                    (false, Some(prev_byte), Some(b'\n')) => {
-                        *prev_byte != b'\r'
-                    }
-                    // Going forward, current byte is \r, this is a match if
-                    // the previous byte is not \n.
-                    (false, Some(prev_byte), Some(b'\r')) => {
-                        *prev_byte != b'\n'
-                    }
-                    // Going backward, no previous byte, we are at the end of
-                    // the data, this is a match.
-                    (true, None, _) => true,
-                    // Going backward, previous byte is \n, this is a match if
-                    // the current byte is not \r.
-                    (true, Some(b'\n'), Some(curr_byte)) => {
-                        *curr_byte != b'\r'
-                    }
-                    // Going backward, previous byte is \r, this is a match if
-                    // the current byte is not \n.
-                    (true, Some(b'\r'), Some(curr_byte)) => {
-                        *curr_byte != b'\n'
-                    }
-                    _ => false,
-                };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::WordStart => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    (false, Some(p), Some(c)) | (true, Some(c), Some(p)) => {
-                        !is_word_char(*p) && is_word_char(*c)
-                    }
-                    (false, None, Some(c)) | (true, Some(c), None) => {
-                        is_word_char(*c)
-                    }
-                    _ => false,
-                };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::WordEnd => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    (false, Some(p), Some(c)) | (true, Some(c), Some(p)) => {
-                        is_word_char(*p) && !is_word_char(*c)
-                    }
-                    (false, Some(p), None) | (true, None, Some(p)) => {
-                        is_word_char(*p)
-                    }
-                    _ => false,
-                };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::WordStartHalf => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    (false, None, _) | (true, _, None) => true,
-                    (false, Some(b), _) | (true, _, Some(b)) => {
-                        !is_word_char(*b)
-                    }
-                };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::WordEndHalf => {
-                let is_match = match (start.backwards(), prev_byte, curr_byte)
-                {
-                    (false, _, None) | (true, None, _) => true,
-                    (false, _, Some(b)) | (true, Some(b), _) => {
-                        !is_word_char(*b)
-                    }
-                };
-                if is_match {
-                    state.threads.push((
-                        apply_offset(ip, instr_size.into()),
-                        rep_count,
-                    ));
-                }
-            }
-            Instr::WordBoundary | Instr::WordBoundaryNeg => {
-                let mut is_match = match (prev_byte, curr_byte) {
-                    (Some(p), Some(c)) => is_word_char(*p) != is_word_char(*c),
-                    (None, Some(b)) | (Some(b), None) => is_word_char(*b),
-                    _ => false,
-                };
-
-                if matches!(instr, Instr::WordBoundaryNeg) {
-                    is_match = !is_match;
-                }
-
                 if is_match {
                     state.threads.push((
                         apply_offset(ip, instr_size.into()),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -212,7 +213,6 @@ func TestScannerMaxMatchesPerPattern(t *testing.T) {
 	assert.Len(t, matchingRules, 1)
 }
 
-
 func TestScannerGarbageCollected(t *testing.T) {
 	r, _ := Compile(`rule t { condition: true }`)
 	collected := make(chan struct{})
@@ -236,4 +236,39 @@ func TestScannerGarbageCollected(t *testing.T) {
 	}
 
 	t.Fatal("scanner was not garbage collected")
+}
+
+func TestScannerConcurrentGoroutinesWithModule(t *testing.T) {
+	const rule = `
+import "pe"
+rule uses_pe {
+	condition: pe.number_of_sections > 100
+}`
+
+	r, err := Compile(rule)
+	require.NoError(t, err)
+	defer r.Destroy()
+
+	data := []byte("not a PE file")
+	const workers = 16
+	const scans = 2000
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s := NewScanner(r)
+			defer s.Destroy()
+			for j := 0; j < scans; j++ {
+				_, err := s.Scan(data)
+				if err != nil {
+					t.Errorf("scan failed: %v", err)
+					return
+				}
+				runtime.Gosched()
+			}
+		}()
+	}
+	wg.Wait()
 }
