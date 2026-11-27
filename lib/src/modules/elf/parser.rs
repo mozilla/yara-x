@@ -139,12 +139,10 @@ impl ElfParser {
         self.result.dynamic_section_entries =
             Some(self.result.dynamic.len().try_into().unwrap());
 
-        // If the number of sections is greater than ELF_SHN_LORESERVE the
-        // header is probably corrupt, exit early.
-        if ehdr.sh_entry_count >= Self::ELF_SHN_LORESERVE {
-            return Ok(mem::take(&mut self.result));
-        }
-
+        // Compute the entry point before checking whether the section table
+        // was parsed: for executables and shared objects it depends only on
+        // the segments, so a missing or bogus section table must not prevent
+        // the entry point from being resolved.
         if let Some(elf_type) = self.result.type_
             && ehdr.entry_point != 0
         {
@@ -226,6 +224,7 @@ impl ElfParser {
     // 64-bit ELF file
     const ELF_DATA_2LSB: u8 = 0x01;
     const ELF_DATA_2MSB: u8 = 0x02;
+    const ELF_PT_LOAD: u32 = 0x01;
     const ELF_PT_DYNAMIC: u32 = 0x02;
     const ELF_SHN_LORESERVE: u16 = 0xFF00;
     const ELF_DT_NULL: u64 = 0;
@@ -266,27 +265,36 @@ impl ElfParser {
         rva: u64,
     ) -> Option<u64> {
         match elf_type.enum_value() {
-            Ok(elf::Type::ET_EXEC) | Ok(elf::Type::ET_DYN) => {
-                for segment in segments.iter() {
-                    if segment.virt_addr_range()?.contains(&rva) {
-                        return segment
-                            .offset
-                            .checked_add(rva - segment.virt_addr);
-                    }
-                }
-            }
-            _ => {
-                for section in sections.iter() {
-                    if section.type_ != Self::ELF_SHT_NOBITS
-                        && section.type_ != Self::ELF_SHT_NULL
-                        && section.addr_range()?.contains(&rva)
-                    {
-                        return section.offset.checked_add(rva - section.addr);
-                    }
-                }
-            }
+            // Executables (`ET_EXEC`) and shared libraries / PIE executables
+            // (`ET_DYN`) are execution-view files mapped by the loader using
+            // program headers; section headers are optional and may be
+            // stripped. Only `PT_LOAD` segments are mapped into memory, in
+            // program header table order (later mappings replace earlier ones
+            // at overlapping addresses). Search from the back so the last
+            // matching `PT_LOAD` wins, and ignore segments with overflowing
+            // address ranges instead of aborting the search.
+            Ok(elf::Type::ET_EXEC) | Ok(elf::Type::ET_DYN) => segments
+                .iter()
+                .filter(|s| s.type_ == Self::ELF_PT_LOAD)
+                .rfind(|s| {
+                    s.virt_addr_range()
+                        .is_some_and(|range| range.contains(&rva))
+                })
+                .and_then(|s| s.offset.checked_add(rva - s.virt_addr)),
+            // Other ELF types (primarily `ET_REL` relocatable object files)
+            // are linking-view files without program headers, so translate
+            // through the section headers instead.
+            _ => sections
+                .iter()
+                .filter(|s| {
+                    s.type_ != Self::ELF_SHT_NOBITS
+                        && s.type_ != Self::ELF_SHT_NULL
+                })
+                .find(|s| {
+                    s.addr_range().is_some_and(|range| range.contains(&rva))
+                })
+                .and_then(|s| s.offset.checked_add(rva - s.addr)),
         }
-        None
     }
 
     fn parse_segments(&self, ehdr: &Ehdr, input: &[u8]) -> Option<Vec<Phdr>> {
@@ -300,6 +308,13 @@ impl ElfParser {
     }
 
     fn parse_sections(&self, ehdr: &Ehdr, input: &[u8]) -> Option<Vec<Shdr>> {
+        // If the number of sections is greater than or equal to
+        // ELF_SHN_LORESERVE the header is probably corrupt, skip parsing the
+        // section table.
+        if ehdr.sh_entry_count >= Self::ELF_SHN_LORESERVE {
+            return None;
+        }
+
         let offset = usize::try_from(ehdr.sh_offset).ok()?;
         input.get(offset..).and_then(|sections| {
             count(self.parse_shdr(), ehdr.sh_entry_count as usize)
