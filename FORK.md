@@ -56,3 +56,13 @@ git push origin 2026.11.27
 This triggers the [Release Python library](.github/workflows/release_python.yaml) workflow, which builds the Python wheels and creates a **draft** GitHub Release with them attached. Review the draft on the Releases page and publish it, which triggers the [SBOM](.github/workflows/sbom.yml) workflow.
 
 The wheel version comes from `py/Cargo.toml`, not from the tag. Do not push `v*` tags, which are reserved for upstream releases.
+
+### Updating addons-server
+
+[addons-server](https://github.com/mozilla/addons-server) is the sole consumer of this fork. Once the release is published, update `requirements/yara-x.txt` in addons-server to point to the new `manylinux_*_x86_64` wheel. The URL and the SHA256 can both be found in the release's **Assets** section:
+
+```
+# our own fork of yara-x
+https://github.com/mozilla/yara-x/releases/download/<tag>/yara_x-<version>-cp38-abi3-manylinux_2_34_x86_64.whl \
+    --hash=sha256:<sha256>
+```
