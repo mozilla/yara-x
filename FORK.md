@@ -41,3 +41,18 @@ git push origin sync-upstream
 ```
 
 Then open a Pull Request from `sync-upstream` into `amo` and merge it once CI passes. You can reference the issue number in the PR description (e.g., `Fixes #123`).
+
+## Releasing
+
+Push a date-based tag (`YYYY.MM.DD`) from the `amo` branch:
+
+```bash
+git checkout amo
+git pull origin amo
+git tag 2026.11.27
+git push origin 2026.11.27
+```
+
+This triggers the [Release Python library](.github/workflows/release_python.yaml) workflow, which builds the Python wheels and creates a **draft** GitHub Release with them attached. Review the draft on the Releases page and publish it, which triggers the [SBOM](.github/workflows/sbom.yml) workflow.
+
+The wheel version comes from `py/Cargo.toml`, not from the tag. Do not push `v*` tags, which are reserved for upstream releases.
