@@ -166,6 +166,14 @@ impl AuthenticodeHasher for PE<'_> {
         let mut sum_of_bytes_hashed =
             self.optional_hdr.size_of_headers as usize;
 
+        // Disjoint sections can't add up to more bytes than the file length.
+        // Cap the cumulative hashed bytes to `size_of_headers + file length`
+        // (preserving PEs where headers overlap the first section) so a file
+        // with up to `MAX_PE_SECTIONS` overlapping sections can't force the
+        // digest to re-hash the file up to 96 times.
+        let max_bytes_hashed =
+            sum_of_bytes_hashed.saturating_add(self.data.len());
+
         // Hash each section's data.
         for section in sections {
             let section_start = section.raw_data_offset as usize;
@@ -173,10 +181,14 @@ impl AuthenticodeHasher for PE<'_> {
             let section_end = section_start.saturating_add(section_size);
             let section_bytes = self.data.get(section_start..section_end)?;
 
-            digest.update(section_bytes);
-
             sum_of_bytes_hashed =
                 sum_of_bytes_hashed.checked_add(section_size)?;
+
+            if sum_of_bytes_hashed > max_bytes_hashed {
+                return None;
+            }
+
+            digest.update(section_bytes);
         }
 
         let extra_hash_len = self
@@ -1628,8 +1640,8 @@ impl<'a> PE<'a> {
             let signatures = authenticode_parser
                 .parse(signature_data, self)
                 .map_err(|_| {
-                    Err::Error(Error::new(signature_data, ErrorKind::Fail))
-                })?;
+                Err::Error(Error::new(signature_data, ErrorKind::Fail))
+            })?;
 
             // The next WIN_CERTIFICATE is aligned to the next 8-bytes boundary.
             let (remainder, _) = take(Self::round_up::<8, _>(length))(input)?;
@@ -1972,17 +1984,6 @@ impl<'a> PE<'a> {
                     thunk & 0x8000000000000000 != 0
                 };
 
-                // Check that thunk doesn't exceed the maximum possible value.
-                // The maximum possible value occurs when the most significant
-                // bit is set (import by ordinal) and the ordinal number is
-                // 65535, which is the maximum possible ordinal.
-                let max_thunk =
-                    if is_32_bits { 0x8000ffff } else { 0x800000000000ffff };
-
-                if thunk > max_thunk {
-                    continue;
-                }
-
                 let mut func = ImportedFunc {
                     rva: descriptor.import_address_table.saturating_add(
                         (i * if is_32_bits { 4 } else { 8 }) as u32,
@@ -1991,6 +1992,11 @@ impl<'a> PE<'a> {
                 };
 
                 if import_by_ordinal {
+                    // The ordinal number is in the lower 16 bits. The bits
+                    // between the ordinal number and the most significant bit
+                    // are reserved and should be zero, but the Windows loader
+                    // ignores them, so thunks where some of those bits are set
+                    // must not be discarded.
                     let ordinal = (thunk & 0xffff) as u16;
                     func.ordinal = Some(ordinal);
                     func.name = ord_to_name(import_dll, ordinal);
@@ -2218,9 +2224,17 @@ impl<'a> PE<'a> {
             }
         }
 
-        let names = self
-            .parse_at_rva(exports.address_of_names, count(le_u32, num_names))
-            .unwrap_or_default();
+        // `number_of_names` can be larger than the number of entries actually
+        // present in the file (e.g. when the array sits at the end of a
+        // section that is larger in memory than on disk, or the file is
+        // truncated). Read the entries that are available instead of
+        // discarding all of them.
+        let names: Vec<u32> = iterator(
+            self.data_at_rva(exports.address_of_names).unwrap_or_default(),
+            le_u32::<&[u8], Error>,
+        )
+        .take(num_names)
+        .collect();
 
         let name_ordinals = self
             .data_at_rva(exports.address_of_name_ordinals)
